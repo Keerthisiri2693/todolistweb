@@ -6,6 +6,10 @@ import React, {
   useState,
 } from "react";
 import {
+  NativeSyntheticEvent,
+  TextInputKeyPressEventData,
+} from "react-native";
+import {
   ActivityIndicator,
   Alert,
   Image,
@@ -20,15 +24,16 @@ import {
   Text,
   TextInput,
   View,
+  useWindowDimensions,
 } from "react-native";
-import DraggableFlatList, {
-  ScaleDecorator,
-} from "react-native-draggable-flatlist";
-import { updateHomeNoteWidget } from "../../utils/homeNoteWidget";
+
+import { DateTimePickerAndroid } from "@react-native-community/datetimepicker";
+import { RichEditor } from "react-native-pell-rich-editor";
 
 import { Ionicons } from "@expo/vector-icons";
+
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { DateTimePickerAndroid } from "@react-native-community/datetimepicker";
+
 import axios from "axios";
 import {
   AudioModule,
@@ -40,6 +45,7 @@ import {
   useAudioRecorderState,
 } from "expo-audio";
 import * as Clipboard from "expo-clipboard";
+import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
@@ -47,10 +53,12 @@ import * as Notifications from "expo-notifications";
 import { router, useLocalSearchParams } from "expo-router";
 import { VideoView, useVideoPlayer } from "expo-video";
 import { SafeAreaView } from "react-native-safe-area-context";
-import Svg, { Path } from "react-native-svg";
 import { captureRef } from "react-native-view-shot";
 import { useAppTheme } from "../../context/app-theme-context";
-import { NitroDigitalInk } from "../../utils/NitroDigitalInk.web";
+
+import DraggableFlatList, {
+  ScaleDecorator,
+} from "react-native-draggable-flatlist";
 
 const API_BASE_URL = "https://todolistbackend-855c.onrender.com";
 
@@ -60,6 +68,16 @@ type ReorderChecklistItem = {
   id: string;
   text: string;
   checked: boolean;
+};
+
+const mintTheme = {
+  background: "#EAF8F1",
+  surface: "#F5FCF8",
+  primary: "#16866A",
+  primaryDark: "#116B55",
+  border: "#D3EDE0",
+  text: "#183B32",
+  subtitle: "#6B877C",
 };
 
 type DrawingPoint = { x: number; y: number; t?: number };
@@ -84,9 +102,26 @@ type TodoItem = {
   backgroundImage?: string;
   quickNoteColor?: string;
   quickNotePinned?: boolean;
-  notePattern?: "plain" | "lined" | "dotted" | "grid";
+  notePattern?: string;
+  notebookStyle?: "classic" | "minimal" | "journal";
+  noteTextSize?: "small" | "medium" | "large";
+  noteCornerStyle?: "square" | "rounded" | "soft";
+  alignment?: "left" | "center" | "right";
   createdAt?: string;
   updatedAt?: string;
+  isLocalDuplicate?: boolean;
+};
+
+type ExistingAttachment = {
+  id: string;
+  type: string;
+  name: string;
+  uri: string;
+};
+
+type WebSelectedFile = {
+  uri: string;
+  file: File;
 };
 
 type ApiResponse = {
@@ -96,11 +131,6 @@ type ApiResponse = {
   todo?: TodoItem;
   task?: TodoItem;
 };
-
-const createLocalQuickNoteId = () =>
-  `quick-note-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-const LOCAL_QUICK_NOTES_KEY = "local-quick-notes";
 
 type LocalQuickNote = {
   _id: string;
@@ -115,7 +145,7 @@ type LocalQuickNote = {
   voiceUri?: string;
   backgroundImageUri?: string;
   backgroundImageUrl?: string;
-  notePattern?: "plain" | "lined" | "dotted" | "grid";
+  notePattern?: string;
   serverTodoId?: string;
   isQuickNote: true;
   quickNoteColor: string;
@@ -126,17 +156,17 @@ type LocalQuickNote = {
 };
 
 const COLORS = {
-  background: "#F3F7F5",
-  surface: "#FFFFFF",
-  primary: "#239B83",
-  primaryDark: "#176B5D",
-  primaryLight: "#E0F4EE",
-  text: "#172F2B",
-  secondaryText: "#71827D",
-  border: "#DCEAE5",
-  muted: "#EDF4F1",
-  green: "#16866D",
-  greenLight: "#E0F5EC",
+  background: "#EAF8F1",
+  surface: "#F5FCF8",
+  primary: "#16866A",
+  primaryDark: "#116B55",
+  primaryLight: "#DDF4E8",
+  text: "#183B32",
+  secondaryText: "#6B877C",
+  border: "#D3EDE0",
+  muted: "#E4F5EC",
+  green: "#16866A",
+  greenLight: "#DDF4E8",
   orange: "#C9852A",
   orangeLight: "#FFF4E3",
   red: "#D94F5C",
@@ -180,6 +210,139 @@ const getFileName = (uri: string, fallback: string) => {
   return lastPart || `${fallback}_${Date.now()}`;
 };
 
+/**
+ * Appends a local file to multipart FormData.
+ *
+ * React Native networking accepts { uri, name, type } descriptors.
+ * Browser/Electron FormData does not: it requires a real Blob/File.
+ * This helper keeps native behaviour and converts local web/blob URIs
+ * into Blob objects before appending them.
+ */
+const appendLocalUpload = async (
+  formData: FormData,
+  fieldName: string,
+  uri: string,
+  fileName: string,
+  mimeType: string,
+  webFile?: Blob | null,
+) => {
+  if (Platform.OS === "web") {
+    let blob: Blob;
+
+    if (webFile instanceof Blob) {
+      blob = webFile;
+    } else {
+      const response = await fetch(uri);
+      if (!response.ok) {
+        throw new Error(`Unable to read attachment: ${fileName}`);
+      }
+      blob = await response.blob();
+    }
+
+    const resolvedType = blob.type || mimeType || "application/octet-stream";
+    const uploadBlob =
+      blob.type === resolvedType
+        ? blob
+        : new Blob([blob], { type: resolvedType });
+
+    formData.append(fieldName, uploadBlob, fileName);
+    return;
+  }
+
+  formData.append(
+    fieldName,
+    {
+      uri,
+      name: fileName,
+      type: mimeType || "application/octet-stream",
+    } as unknown as Blob,
+  );
+};
+
+const getAudioMimeType = (fileName: string, fallback = "audio/mp4") => {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  if (extension === "webm") return "audio/webm";
+  if (extension === "wav") return "audio/wav";
+  if (extension === "mp3") return "audio/mpeg";
+  if (extension === "aac") return "audio/aac";
+  if (extension === "ogg" || extension === "opus") return "audio/ogg";
+  if (extension === "m4a" || extension === "mp4") return "audio/mp4";
+  return fallback;
+};
+
+const getExistingAttachments = (
+  todo: TodoItem | null | undefined,
+): ExistingAttachment[] => {
+  if (!todo) return [];
+
+  const rawTodo = todo as TodoItem & Record<string, unknown>;
+
+  // The API/local cache may serialize fileIds as JSON text instead of an array.
+  // Normalize both formats so editing does not silently drop saved attachments.
+  const rawIds: unknown[] = (() => {
+    if (Array.isArray(todo.fileIds)) return todo.fileIds;
+    if (typeof todo.fileIds === "string" && todo.fileIds.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(todo.fileIds);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {
+        // Some older records stored a single ID as plain text.
+        return [todo.fileIds];
+      }
+    }
+    const legacyIds = rawTodo.attachmentIds ?? rawTodo.files;
+    if (Array.isArray(legacyIds)) {
+      return legacyIds.map((entry) =>
+        entry && typeof entry === "object"
+          ? ((entry as Record<string, unknown>).id ??
+            (entry as Record<string, unknown>).fileId ??
+            (entry as Record<string, unknown>)._id)
+          : entry,
+      );
+    }
+    return [];
+  })();
+  const rawTypes = Array.isArray(rawTodo.fileTypes)
+    ? rawTodo.fileTypes
+    : Array.isArray(rawTodo.attachmentTypes)
+      ? rawTodo.attachmentTypes
+      : Array.isArray(rawTodo.mimeTypes)
+        ? rawTodo.mimeTypes
+        : Array.isArray(todo.type)
+          ? todo.type
+          : todo.type
+            ? [todo.type]
+            : [];
+
+  const rawNames = Array.isArray(rawTodo.fileNames)
+    ? rawTodo.fileNames
+    : Array.isArray(rawTodo.attachmentNames)
+      ? rawTodo.attachmentNames
+      : [];
+
+  return rawIds
+    .map((rawId, index) => {
+      if (rawId === null || rawId === undefined || String(rawId).trim() === "")
+        return null;
+      const id = String(rawId);
+      const rawType = rawTypes[index] ?? rawTypes[0] ?? "";
+      const type =
+        typeof rawType === "string" ? rawType : String(rawType ?? "");
+      const rawName = rawNames[index];
+      const name =
+        typeof rawName === "string" && rawName.trim()
+          ? rawName
+          : `Attachment ${index + 1}`;
+      return {
+        id,
+        type,
+        name,
+        uri: `${API_BASE_URL.replace(/\/+$/, "")}/api/media/${encodeURIComponent(id)}`,
+      };
+    })
+    .filter((item): item is ExistingAttachment => item !== null);
+};
+
 const parseDateText = (value: string): Date | null => {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
   if (!match) return null;
@@ -197,20 +360,7 @@ const parseDateText = (value: string): Date | null => {
   date.setHours(0, 0, 0, 0);
   return date;
 };
-const showAppAlert = (title: string, message: string, onOk?: () => void) => {
-  if (Platform.OS === "web") {
-    window.alert(`${title}\n\n${message}`);
-    onOk?.();
-    return;
-  }
 
-  Alert.alert(title, message, [
-    {
-      text: "OK",
-      onPress: onOk,
-    },
-  ]);
-};
 const formatLongDate = (dateText: string) => {
   const date = parseDateText(dateText);
   if (!date) return "Choose due date";
@@ -253,19 +403,481 @@ function VideoPreview({ uri }: VideoPreviewProps) {
   );
 }
 
+type NotePatternProps = {
+  pattern: string;
+  ink: string;
+};
+
+/** Shared pattern renderer used by both the paper-theme previews and note editor. */
+
+/** Shared pattern renderer used by paper-theme previews and note editor. */
+function NotePattern({ pattern, ink }: NotePatternProps) {
+  const rows = Array.from({ length: 8 });
+  const cols = Array.from({ length: 10 });
+  const normalized = (pattern || "plain").trim().toLowerCase();
+
+  if (!normalized || normalized === "plain") return null;
+
+  const motifGlyph: Record<string, string> = {
+    heart: "♥",
+    hearts: "♥",
+    star: "★",
+    stars: "✦",
+    flower: "✿",
+    leaf: "❧",
+    coffee: "☕",
+    bubbles: "○",
+    sunrise: "☀",
+    petals: "❀",
+    clouds: "☁",
+    rainbow: "⌒",
+    sparkles: "✧",
+    snowflakes: "❄",
+    ornamental: "❧",
+  };
+
+  const motifPatterns = new Set(Object.keys(motifGlyph));
+
+  return (
+    <View
+      pointerEvents="none"
+      collapsable={false}
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        height: "100%",
+        overflow: "hidden",
+        zIndex: 2,
+        elevation: 2,
+      }}
+    >
+      {/* LINED */}
+      {(normalized === "lined" || normalized === "stripes") &&
+        Array.from({ length: 14 }, (_, index) => (
+          <View
+            key={`line-${index}`}
+            style={{
+              position: "absolute",
+              left: 0,
+              right: 0,
+              top: `${7 + index * 7.5}%`,
+              height: 1,
+              backgroundColor: ink,
+            }}
+          />
+        ))}
+
+      {/* DOTS */}
+      {(normalized === "dotted" ||
+        normalized === "dots" ||
+        normalized === "microdots") &&
+        rows.map((_, row) =>
+          cols.map((__, col) => (
+            <View
+              key={`dot-${row}-${col}`}
+              style={{
+                position: "absolute",
+                left: `${5 + col * 10}%`,
+                top: `${6 + row * 12}%`,
+                width: normalized === "microdots" ? 2 : 3.5,
+                height: normalized === "microdots" ? 2 : 3.5,
+                borderRadius: 4,
+                backgroundColor: ink,
+                opacity: normalized === "microdots" ? 0.55 : 0.78,
+              }}
+            />
+          )),
+        )}
+
+      {/* GRID */}
+      {normalized === "grid" && (
+        <>
+          {Array.from({ length: 13 }, (_, index) => (
+            <View
+              key={`grid-v-${index}`}
+              style={{
+                position: "absolute",
+                left: `${index * 8.33}%`,
+                top: 0,
+                bottom: 0,
+                width: 1,
+                backgroundColor: ink,
+                opacity: 0.7,
+              }}
+            />
+          ))}
+          {Array.from({ length: 14 }, (_, index) => (
+            <View
+              key={`grid-h-${index}`}
+              style={{
+                position: "absolute",
+                top: `${index * 7.7}%`,
+                left: 0,
+                right: 0,
+                height: 1,
+                backgroundColor: ink,
+                opacity: 0.7,
+              }}
+            />
+          ))}
+        </>
+      )}
+
+      {/* DIAGONAL */}
+      {normalized === "diagonal" &&
+        Array.from({ length: 17 }, (_, index) => (
+          <View
+            key={`diagonal-${index}`}
+            style={{
+              position: "absolute",
+              left: "-25%",
+              top: `${index * 8}%`,
+              width: "150%",
+              height: 1.2,
+              backgroundColor: ink,
+              opacity: 0.75,
+              transform: [{ rotate: "-25deg" }],
+            }}
+          />
+        ))}
+
+      {/* WAVES */}
+      {normalized === "waves" &&
+        Array.from({ length: 8 }, (_, index) => (
+          <Text
+            key={`wave-${index}`}
+            numberOfLines={1}
+            style={{
+              position: "absolute",
+              left: "-5%",
+              top: `${index * 14}%`,
+              width: "115%",
+              color: ink,
+              fontSize: 25,
+              letterSpacing: 3,
+              opacity: 0.75,
+            }}
+          >
+            〰 〰 〰 〰 〰
+          </Text>
+        ))}
+
+      {/* CIRCLES */}
+      {normalized === "circles" &&
+        rows.map((_, row) =>
+          cols.map((__, col) => (
+            <View
+              key={`circle-${row}-${col}`}
+              style={{
+                position: "absolute",
+                left: `${2 + col * 11}%`,
+                top: `${2 + row * 12}%`,
+                width: 22,
+                height: 22,
+                borderRadius: 12,
+                borderWidth: 1.2,
+                borderColor: ink,
+                opacity: 0.65,
+              }}
+            />
+          )),
+        )}
+
+      {/* CHECKER */}
+      {normalized === "checker" &&
+        Array.from({ length: 8 }, (_, row) =>
+          Array.from({ length: 10 }, (_, col) =>
+            (row + col) % 2 === 0 ? (
+              <View
+                key={`checker-${row}-${col}`}
+                style={{
+                  position: "absolute",
+                  left: `${col * 10}%`,
+                  top: `${row * 12.5}%`,
+                  width: "10%",
+                  height: "12.5%",
+                  backgroundColor: ink,
+                  opacity: 0.13,
+                }}
+              />
+            ) : null,
+          ),
+        )}
+
+      {/* ZIGZAG */}
+      {normalized === "zigzag" &&
+        Array.from({ length: 8 }, (_, row) => (
+          <Text
+            key={`zigzag-${row}`}
+            numberOfLines={1}
+            style={{
+              position: "absolute",
+              left: "-3%",
+              top: `${row * 14}%`,
+              width: "110%",
+              color: ink,
+              fontSize: 23,
+              letterSpacing: 5,
+              opacity: 0.72,
+            }}
+          >
+            ⌁⌁⌁⌁⌁⌁⌁
+          </Text>
+        ))}
+
+      {/* CROSS */}
+      {normalized === "cross" &&
+        rows.map((_, row) =>
+          cols.map((__, col) => (
+            <Text
+              key={`cross-${row}-${col}`}
+              style={{
+                position: "absolute",
+                left: `${5 + col * 10}%`,
+                top: `${5 + row * 12}%`,
+                color: ink,
+                fontSize: 12,
+                opacity: 0.68,
+              }}
+            >
+              ✚
+            </Text>
+          )),
+        )}
+
+      {/* CONFETTI */}
+      {normalized === "confetti" &&
+        Array.from({ length: 48 }, (_, index) => {
+          const glyphs = ["•", "✦", "▪", "✧", "＋"];
+          return (
+            <Text
+              key={`confetti-${index}`}
+              style={{
+                position: "absolute",
+                left: `${(index * 37) % 96}%`,
+                top: `${(index * 53) % 94}%`,
+                color: ink,
+                fontSize: index % 3 === 0 ? 13 : 10,
+                opacity: 0.75,
+                transform: [{ rotate: `${(index * 29) % 90}deg` }],
+              }}
+            >
+              {glyphs[index % glyphs.length]}
+            </Text>
+          );
+        })}
+
+      {/* DIAMONDS */}
+      {normalized === "diamonds" &&
+        rows.map((_, row) =>
+          cols.map((__, col) => (
+            <View
+              key={`diamond-${row}-${col}`}
+              style={{
+                position: "absolute",
+                left: `${5 + col * 10}%`,
+                top: `${5 + row * 12}%`,
+                width: 11,
+                height: 11,
+                borderWidth: 1.1,
+                borderColor: ink,
+                transform: [{ rotate: "45deg" }],
+                opacity: 0.75,
+              }}
+            />
+          )),
+        )}
+
+      {/* THEMES WITH REPEATED MOTIFS */}
+      {motifPatterns.has(normalized) &&
+        rows.map((_, row) =>
+          cols.map((__, col) => {
+            const glyph = motifGlyph[normalized];
+            const alternate =
+              normalized === "bubbles" ||
+              normalized === "petals" ||
+              normalized === "sparkles" ||
+              normalized === "snowflakes" ||
+              normalized === "ornamental";
+            const useGlyph = !alternate || (row + col) % 2 === 0;
+
+            return (
+              <Text
+                key={`motif-${normalized}-${row}-${col}`}
+                style={{
+                  position: "absolute",
+                  left: `${3 + col * 10}%`,
+                  top: `${2 + row * 12}%`,
+                  color: ink,
+                  fontSize:
+                    normalized === "coffee"
+                      ? 15
+                      : normalized === "bubbles"
+                        ? 19
+                        : normalized === "clouds"
+                          ? 19
+                          : normalized === "snowflakes"
+                            ? 16
+                            : normalized === "sparkles"
+                              ? 17
+                              : 14,
+                  lineHeight: 22,
+                  opacity: normalized === "ornamental" ? 0.58 : 0.72,
+                }}
+              >
+                {useGlyph
+                  ? glyph
+                  : normalized === "bubbles"
+                    ? "◌"
+                    : normalized === "petals"
+                      ? "✿"
+                      : normalized === "sparkles"
+                        ? "✦"
+                        : normalized === "snowflakes"
+                          ? "✳"
+                          : "❖"}
+              </Text>
+            );
+          }),
+        )}
+
+      {/* SUNRISE HORIZON */}
+      {normalized === "sunrise" && (
+        <>
+          <View
+            style={{
+              position: "absolute",
+              left: "35%",
+              top: "25%",
+              width: 58,
+              height: 58,
+              borderRadius: 29,
+              backgroundColor: ink,
+              opacity: 0.16,
+            }}
+          />
+          {[0, 1, 2, 3].map((index) => (
+            <View
+              key={`sunrise-line-${index}`}
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                top: `${57 + index * 9}%`,
+                height: 1.5,
+                backgroundColor: ink,
+                opacity: 0.65 - index * 0.1,
+              }}
+            />
+          ))}
+        </>
+      )}
+
+      {/* RAINBOW ARCS */}
+      {normalized === "rainbow" &&
+        [0, 1, 2, 3].map((index) => (
+          <View
+            key={`rainbow-${index}`}
+            style={{
+              position: "absolute",
+              width: 105 + index * 22,
+              height: 105 + index * 22,
+              borderRadius: 100,
+              borderWidth: 3,
+              borderColor: ink,
+              opacity: 0.16,
+              left: "22%",
+              top: "28%",
+            }}
+          />
+        ))}
+    </View>
+  );
+}
+
 export default function TodolistScreen() {
+  const [hyperlinkModalVisible, setHyperlinkModalVisible] = useState(false);
+  const [hyperlinkList, setHyperlinkList] = useState<string[]>([]);
+  const [selectedHyperlink, setSelectedHyperlink] = useState<string | null>(
+    null,
+  );
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  const isDesktop = Platform.OS === "web" && screenWidth >= 1100;
+  const isWideDesktop = Platform.OS === "web" && screenWidth >= 1500;
+
+  // Cross-platform alert state. Desktop/Web uses the custom modal below;
+  // Android and iOS continue using the native React Native alert.
+  type DesktopAlertButton = NonNullable<
+    Parameters<typeof Alert.alert>[2]
+  >[number];
+  type DesktopAlertOptions = Parameters<typeof Alert.alert>[3];
+
+  const [appAlert, setAppAlert] = useState<{
+    visible: boolean;
+    title: string;
+    message: string;
+    buttons: DesktopAlertButton[];
+    options?: DesktopAlertOptions;
+  }>({
+    visible: false,
+    title: "",
+    message: "",
+    buttons: [],
+  });
+
+  const showAlert = (
+    title: string,
+    message: string = "",
+    buttons?: DesktopAlertButton[],
+    options?: DesktopAlertOptions,
+  ) => {
+    if (Platform.OS !== "web") {
+      Alert.alert(title, message, buttons, options);
+      return;
+    }
+
+    setAppAlert({
+      visible: true,
+      title,
+      message,
+      buttons:
+        buttons && buttons.length > 0
+          ? buttons
+          : [{ text: "OK", style: "default" }],
+      options,
+    });
+  };
+
+  const closeAppAlert = () => {
+    setAppAlert((previous) => ({
+      ...previous,
+      visible: false,
+    }));
+    appAlert.options?.onDismiss?.();
+  };
+  const isNarrowPhone = screenWidth < 360;
+  const isCompactPhone = screenWidth < 390;
+  const isShortScreen = screenHeight < 700;
+  const pageHorizontalPadding = isNarrowPhone ? 12 : isCompactPhone ? 16 : 20;
   const { isDark, colors: appTheme } = useAppTheme();
   const [reorderChecklistVisible, setReorderChecklistVisible] = useState(false);
-  const [showDesktopDatePicker, setShowDesktopDatePicker] = useState(false);
-  const [desktopPickerMode, setDesktopPickerMode] = useState<
-    "due" | "reminder"
-  >("due");
+  const [selectedTextColor, setSelectedTextColor] = useState("#172F2B");
+  const [attachedFiles, setAttachedFiles] = useState<
+    DocumentPicker.DocumentPickerAsset[]
+  >([]);
 
-  const [showDesktopReminderPicker, setShowDesktopReminderPicker] =
-    useState(false);
+  const [drawingLanguage, setDrawingLanguage] = useState<"ta" | "en">("ta");
 
-  const [desktopReminderDate, setDesktopReminderDate] = useState("");
-  const [desktopReminderTime, setDesktopReminderTime] = useState("");
+  const [isNumberedListMode, setIsNumberedListMode] = useState(false);
+  const [isChecklistMode, setIsChecklistMode] = useState(false);
+  const [isNormalTextMode, setIsNormalTextMode] = useState(false);
+  const [checklistItems, setChecklistItems] = useState<
+    { id: string; text: string; checked: boolean }[]
+  >([]);
+  const [listNumber, setListNumber] = useState(1);
+
   const [reorderChecklistItems, setReorderChecklistItems] = useState<
     ReorderChecklistItem[]
   >([]);
@@ -300,110 +912,115 @@ export default function TodolistScreen() {
     setContent(reorderedText);
     setModifiedAt(new Date().toISOString());
   };
-  // Adapt the existing StyleSheet palette to the selected app-wide theme.
-  // Note-specific colors and inline custom colors remain unchanged.
+  // Apply the mint palette to existing screen styles without removing features.
+  // Explicit custom note/paper colors remain intact.
   const themeStyle = (style: any): any => {
     if (!style || typeof style !== "object" || Array.isArray(style))
       return style;
     const result: Record<string, any> = {};
-    const normalize = (value: unknown) =>
-      typeof value === "string" ? value.toLowerCase() : value;
-
+    const mintBackgrounds = new Set([
+      "#ffffff",
+      "#fff",
+      "#fafbfe",
+      "#fafcff",
+      "#f8fafc",
+      "#f9fbfa",
+      "#f3f7f5",
+      "#f5f8f7",
+      "#f7faf9",
+      "#f8fbfa",
+      "#f2faf9",
+      "#fbfefd",
+      "#f6faf8",
+      "#f1f5f3",
+      "#edf4f1",
+      "#e8f0ed",
+      "#e0f4ee",
+      "#eaf7f2",
+      "#e0f5ec",
+      "#f0f7f4",
+      "#f4f8f6",
+    ]);
+    const mintTextColors = new Set([
+      "#172f2b",
+      "#17233f",
+      "#193d37",
+      "#243247",
+      "#24443e",
+      "#254740",
+      "#183a3b",
+      "#123d3b",
+      "#173b38",
+      "#183a35",
+    ]);
+    const mutedTextColors = new Set([
+      "#71827d",
+      "#8491a3",
+      "#87958f",
+      "#8aa19a",
+      "#91a09b",
+      "#737f8e",
+      "#727c96",
+      "#64748b",
+      "#6b7280",
+    ]);
+    const mintAccentColors = new Set([
+      "#239b83",
+      "#16866d",
+      "#16866a",
+      "#138a78",
+      "#20a58b",
+      "#159f89",
+      "#087b72",
+      "#39bda0",
+      "#168a70",
+      "#18a98b",
+    ]);
     Object.entries(style).forEach(([key, value]) => {
       if (typeof value !== "string" || !/^#[0-9a-f]{3,8}$/i.test(value)) {
         result[key] = value;
         return;
       }
-      const hex = normalize(value);
+      const hex = value.toLowerCase();
       if (key === "backgroundColor") {
-        if (
+        if (mintBackgrounds.has(hex)) result[key] = mintTheme.surface;
+        else if (
+          ["#f3f7f5", "#f5f8f7", "#f7faf9", "#f8fbfa", "#f2faf9"].includes(hex)
+        )
+          result[key] = mintTheme.background;
+        else if (
           [
-            "#ffffff",
-            "#fff",
-            "#fafbfe",
-            "#fafcff",
-            "#f8fafc",
-            "#f9fbfa",
-          ].includes(hex as string)
-        ) {
-          result[key] = appTheme.surface;
-        } else if (
-          ["#f3f7f5", "#f5f8f7", "#f7faf9", "#f8fbfa", "#f9fbfa"].includes(
-            hex as string,
-          )
-        ) {
-          result[key] = appTheme.background;
-        } else if (
-          [
-            "#e0f4ee",
-            "#eaf7f2",
-            "#e0f5ec",
+            "#dceae5",
+            "#e5efec",
+            "#e5eeec",
             "#edf4f1",
             "#eef3ff",
-            "#e8f0ed",
-          ].includes(hex as string)
-        ) {
-          result[key] = isDark ? appTheme.surface : appTheme.primaryLight;
-        } else {
-          result[key] = value;
-        }
+            "#e0f4ee",
+            "#eaf7f2",
+          ].includes(hex)
+        )
+          result[key] = mintTheme.background;
+        else result[key] = value;
       } else if (key === "color") {
-        if (
-          [
-            "#172f2b",
-            "#17233f",
-            "#193d37",
-            "#243247",
-            "#24443e",
-            "#254740",
-            "#183a3b",
-            "#123d3b",
-            "#49596c",
-          ].includes(hex as string)
-        ) {
-          result[key] = appTheme.text;
-        } else if (
-          [
-            "#71827d",
-            "#8491a3",
-            "#87958f",
-            "#8aa19a",
-            "#91a09b",
-            "#737f8e",
-            "#727c96",
-          ].includes(hex as string)
-        ) {
-          result[key] = appTheme.secondaryText;
-        } else if (
-          [
-            "#239b83",
-            "#16866d",
-            "#138a78",
-            "#20a58b",
-            "#159f89",
-            "#087b72",
-            "#39bda0",
-          ].includes(hex as string)
-        ) {
-          result[key] = personalAccentColor;
-        } else {
-          result[key] = value;
-        }
+        if (mintTextColors.has(hex)) result[key] = mintTheme.text;
+        else if (mutedTextColors.has(hex)) result[key] = mintTheme.subtitle;
+        else if (mintAccentColors.has(hex)) result[key] = mintTheme.primary;
+        else result[key] = value;
       } else if (key === "borderColor") {
         if (
           [
             "#dceae5",
+            "#dce9e2",
             "#e5eaf3",
             "#e5eeec",
             "#e9eef4",
             "#d7eee6",
             "#e8eeec",
-          ].includes(hex as string)
-        ) {
-          result[key] = appTheme.border;
-        } else {
-          result[key] = value;
-        }
+            "#e5efec",
+          ].includes(hex)
+        )
+          result[key] = mintTheme.border;
+        else result[key] = value;
       } else {
         result[key] = value;
       }
@@ -411,7 +1028,6 @@ export default function TodolistScreen() {
     return result;
   };
   const [strikethrough, setStrikethrough] = useState(false);
-  const [listNumber, setListNumber] = useState(1);
 
   const [linkModalVisible, setLinkModalVisible] = useState(false);
   const [attachmentModalVisible, setAttachmentModalVisible] = useState(false);
@@ -419,27 +1035,10 @@ export default function TodolistScreen() {
 
   const [colorPaletteVisible, setColorPaletteVisible] = useState(false);
   const [fontPickerVisible, setFontPickerVisible] = useState(false);
-  const [videoUri, setVideoUri] = useState<string | null>(null);
+
   const [noteThemePickerVisible, setNoteThemePickerVisible] = useState(false);
 
-  const noteThemes = [
-    { label: "Warm", emoji: "☀️", color: "#FFF4CC", pattern: "lined" },
-    { label: "Fresh", emoji: "🌿", color: "#DDF7E8", pattern: "dotted" },
-    { label: "Ocean", emoji: "🌊", color: "#DDEBFF", pattern: "grid" },
-    { label: "Rose", emoji: "🌸", color: "#FFE4EC", pattern: "plain" },
-    { label: "Lavender", emoji: "💜", color: "#F0E6FF", pattern: "dotted" },
-    { label: "Mint", emoji: "🍃", color: "#E5F7F0", pattern: "lined" },
-    { label: "Peach", emoji: "🌅", color: "#FFE8D6", pattern: "grid" },
-    { label: "Sky", emoji: "🩵", color: "#E3F4FF", pattern: "plain" },
-    { label: "Sand", emoji: "🪵", color: "#F3E9D7", pattern: "lined" },
-    { label: "Midnight", emoji: "🌙", color: "#25283D", pattern: "grid" },
-    { label: "Minimal", emoji: "🤍", color: "#FFFFFF", pattern: "plain" },
-    { label: "Lemon", emoji: "🍋", color: "#FFF9C4", pattern: "dotted" },
-    { label: "Lilac", emoji: "🪻", color: "#EDE7F6", pattern: "lined" },
-    { label: "Forest", emoji: "🌲", color: "#DCEBDD", pattern: "grid" },
-    { label: "Blush", emoji: "🩷", color: "#FCE4EC", pattern: "plain" },
-    { label: "Ice", emoji: "🧊", color: "#E0F7FA", pattern: "dotted" },
-  ];
+  const [isBulletMode, setIsBulletMode] = useState(false);
 
   const textColors = [
     "#172F2B", // Default
@@ -466,7 +1065,7 @@ export default function TodolistScreen() {
     "sans-serif-condensed",
     "casual",
     "cursive",
-  ];
+  ] as const;
 
   const params = useLocalSearchParams<{
     tdlId?: string;
@@ -480,8 +1079,12 @@ export default function TodolistScreen() {
     templateBackground?: string | string[];
     templateBackgroundType?: string | string[];
     selectedDate?: string | string[];
+    folderId?: string | string[];
   }>();
 
+  const folderId = Array.isArray(params.folderId)
+    ? params.folderId[0]
+    : params.folderId;
   // A template selected from Note Templates is still a Todo on this screen.
   // Keep its draft separate from the generic "new Todo" draft.
   const incomingTemplateTitle = Array.isArray(params.templateTitle)
@@ -561,6 +1164,7 @@ export default function TodolistScreen() {
     params.templateBackgroundType,
   ]);
   const contentInputRef = useRef<any>(null);
+  const checklistInputRefs = useRef<Record<number, TextInput | null>>({});
   // This screen is exclusively for Todos. Quick Notes use their own screen.
   const isQuickNote = false;
   const setIsQuickNote = (_value: boolean) => {};
@@ -575,6 +1179,16 @@ export default function TodolistScreen() {
     "square" | "rounded" | "soft"
   >("rounded");
   const [personalAccentColor, setPersonalAccentColor] = useState("#239B83");
+  // appTheme.primary is the shared accent color from AppThemeProvider.
+  // This keeps this editor in sync when the user changes the accent in Settings.
+  useEffect(() => {
+    if (
+      typeof appTheme?.primary === "string" &&
+      /^#[0-9A-Fa-f]{6}$/.test(appTheme.primary)
+    ) {
+      setPersonalAccentColor(appTheme.primary);
+    }
+  }, [appTheme?.primary]);
   const [noteBackgroundImageUri, setNoteBackgroundImageUri] = useState<
     string | null
   >(null);
@@ -587,9 +1201,15 @@ export default function TodolistScreen() {
     "#EDE2FF",
     "#FFFFFF",
   ];
-  const [notePattern, setNotePattern] = useState<
-    "plain" | "lined" | "dotted" | "grid"
-  >("lined");
+  const [notePattern, setNotePattern] = useState<string>("plain");
+  const [pendingNotePattern, setPendingNotePattern] = useState<string>("plain");
+
+  useEffect(() => {
+    if (!noteThemePickerVisible) {
+      setPendingNotePattern(notePattern || "plain");
+    }
+  }, [notePattern, noteThemePickerVisible]);
+
   const noteTemplates = [
     {
       id: "meeting",
@@ -628,7 +1248,7 @@ export default function TodolistScreen() {
     },
   ];
   const applyNoteTemplate = (template: (typeof noteTemplates)[number]) => {
-    Alert.alert(
+    showAlert(
       "Use template?",
       `Replace the current title and content with “${template.title}”?`,
       [
@@ -651,7 +1271,7 @@ export default function TodolistScreen() {
       const permission =
         await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!permission.granted) {
-        Alert.alert(
+        showAlert(
           "Photo permission required",
           "Allow photo access to choose a note background.",
         );
@@ -670,7 +1290,7 @@ export default function TodolistScreen() {
       setModifiedAt(new Date().toISOString());
     } catch (error) {
       console.error("Failed to choose note background", error);
-      Alert.alert("Unable to open gallery", "Please try again.");
+      showAlert("Unable to open gallery", "Please try again.");
     }
   };
 
@@ -690,13 +1310,21 @@ export default function TodolistScreen() {
     "none" | "daily" | "weekly" | "monthly"
   >("none");
 
-  const [imageUri, setImageUri] = useState<string | null>(null);
+  const [imageUris, setImageUris] = useState<string[]>([]);
+  const [videoUris, setVideoUris] = useState<string[]>([]);
+  // Keep the real browser File objects: blob URLs are only for previews and
+  // cannot be uploaded as React Native { uri, name, type } file descriptors.
+  const [webImageFiles, setWebImageFiles] = useState<WebSelectedFile[]>([]);
+  const [webVideoFiles, setWebVideoFiles] = useState<WebSelectedFile[]>([]);
+  const [existingAttachments, setExistingAttachments] = useState<
+    ExistingAttachment[]
+  >([]);
   const [drawingUri, setDrawingUri] = useState<string | null>(null);
   const [drawingModalVisible, setDrawingModalVisible] = useState(false);
   const [drawingText, setDrawingText] = useState("");
   const [drawingRecognitionBusy, setDrawingRecognitionBusy] = useState(false);
   const [drawingRecognitionStatus, setDrawingRecognitionStatus] = useState("");
-  const [drawingLanguage, setDrawingLanguage] = useState<"en-US" | "ta">("ta");
+
   const [drawingStrokes, setDrawingStrokes] = useState<DrawingStroke[]>([]);
   const [currentDrawingStroke, setCurrentDrawingStroke] =
     useState<DrawingStroke | null>(null);
@@ -717,7 +1345,7 @@ export default function TodolistScreen() {
     typeof setTimeout
   > | null>(null);
   const drawingRecognitionRequestRef = useRef(0);
-
+  const richEditorRef = useRef<RichEditor>(null);
   const [voiceUri, setVoiceUri] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [initializing, setInitializing] = useState(true);
@@ -732,12 +1360,10 @@ export default function TodolistScreen() {
   const [letterSpacing, setLetterSpacing] = useState(0);
   const [spacingModalVisible, setSpacingModalVisible] = useState(false);
   const [textColor, setTextColor] = useState("#172F2B");
-  const [fontFamily, setFontFamily] = useState<
-    "System" | "serif" | "monospace"
-  >("System");
-  const [alignment, setAlignment] = useState<
-    "left" | "center" | "right" | "justify"
-  >("left");
+  const [fontFamily, setFontFamily] = useState<string | undefined>(undefined);
+  const [alignment, setAlignment] = useState<"left" | "center" | "right">(
+    "left",
+  );
   const [selection, setSelection] = useState({ start: 0, end: 0 });
   const [createdAt, setCreatedAt] = useState<string>(new Date().toISOString());
   const [modifiedAt, setModifiedAt] = useState<string>(
@@ -745,12 +1371,18 @@ export default function TodolistScreen() {
   );
   const [draftReady, setDraftReady] = useState(false);
   const [draftStatus, setDraftStatus] = useState<
-    "loading" | "saving" | "saved" | "error"
+    "loading" | "saving" | "saved" | "idle" | "error"
   >("loading");
 
   const undoStack = useRef<string[]>([]);
   const redoStack = useRef<string[]>([]);
   const draftLoaded = useRef(false);
+
+  // Prevent auto-save from recreating a draft after a successful database save.
+  const skipDraftAutoSaveRef = useRef(false);
+  const activeDraftKeyRef = useRef<string | null>(null);
+  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const draftWriteInFlightRef = useRef<Promise<void> | null>(null);
 
   const [playerError, setPlayerError] = useState("");
   const [isPaused, setIsPaused] = useState(false);
@@ -778,11 +1410,19 @@ export default function TodolistScreen() {
   const deleteLocalDraft = useCallback(async () => {
     if (loading) return;
     try {
-      // Disable autosave before deleting so the current draft is not recreated.
+      // Disable auto-save and cancel any scheduled write before deleting.
+      skipDraftAutoSaveRef.current = true;
       draftLoaded.current = false;
       setDraftReady(false);
+      if (draftSaveTimerRef.current) {
+        clearTimeout(draftSaveTimerRef.current);
+        draftSaveTimerRef.current = null;
+      }
+      if (draftWriteInFlightRef.current) {
+        await draftWriteInFlightRef.current.catch(() => undefined);
+      }
       await AsyncStorage.removeItem(draftKey);
-      Alert.alert(
+      showAlert(
         "Draft deleted",
         "The local draft was deleted. A Todo already saved on the server is not deleted.",
         [
@@ -794,28 +1434,474 @@ export default function TodolistScreen() {
       );
     } catch (error) {
       console.error("Unable to delete local note draft:", error);
-      Alert.alert(
+      showAlert(
         "Delete failed",
         "Could not delete the local draft. Please try again.",
       );
     }
   }, [draftKey, loading]);
 
+
+const insertChecklist = useCallback(() => {
+  const start = Math.max(0, Math.min(selection.start, content.length));
+
+  const before = content.slice(0, start);
+  const after = content.slice(start);
+
+  const prefix =
+    start === 0 || content[start - 1] === "\n" ? "" : "\n";
+
+  const insertText = `${prefix}☐ `;
+  const updated = before + insertText + after;
+
+  undoStack.current.push(content);
+  redoStack.current = [];
+
+  setContent(updated);
+  setModifiedAt(new Date().toISOString());
+  setIsNormalTextMode(false);
+  setIsChecklistMode(true);
+
+  const cursor = start + insertText.length;
+
+  setSelection({ start: cursor, end: cursor });
+}, [content, selection]);
+
+
+  const toggleChecklistAtCursor = useCallback(() => {
+    const start = Math.max(0, Math.min(selection.start, content.length));
+
+    const lineStart = content.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+
+    const newlineIndex = content.indexOf("\n", start);
+
+    const lineEnd = newlineIndex === -1 ? content.length : newlineIndex;
+
+    const line = content.slice(lineStart, lineEnd);
+
+    const match = line.match(/^(\s*)(☐|☑)(\s*)/);
+
+    if (!match) {
+      return;
+    }
+
+    const next = match[2] === "☐" ? "☑" : "☐";
+
+    const updatedLine =
+      match[1] + next + match[3] + line.slice(match[0].length);
+
+    const updated =
+      content.slice(0, lineStart) + updatedLine + content.slice(lineEnd);
+
+    undoStack.current.push(content);
+    redoStack.current = [];
+
+    setContent(updated);
+    setModifiedAt(new Date().toISOString());
+  }, [content, selection]);
+
+
+  
+
+const handleChecklistKeyPress = useCallback(
+  (
+    index: number,
+    event: NativeSyntheticEvent<TextInputKeyPressEventData>
+  ) => {
+    const key = event.nativeEvent.key;
+
+    // Handle only Backspace.
+    if (key !== "Backspace") return;
+
+    const lines = content.split("\n");
+
+    if (index < 0 || index >= lines.length) return;
+
+    const currentLine = lines[index] ?? "";
+
+    // Match checklist checkbox.
+    const match = currentLine.match(/^(\s*)(☐|☑)(?:\uFE0F)?(\s?)(.*)$/);
+
+    // Not a checklist item.
+    if (!match) return;
+
+    const checkboxText = match[4];
+
+    // Delete only when the checklist item is empty.
+    // Do not delete checkbox when it contains text.
+    if (checkboxText.trim().length > 0) return;
+
+    // Save undo history.
+    undoStack.current.push(content);
+    redoStack.current = [];
+
+    // Remove the empty checklist line.
+    lines.splice(index, 1);
+
+    const updated = lines.join("\n");
+
+    // Update content.
+    setContent(updated);
+    setModifiedAt(new Date().toISOString());
+
+    // Calculate previous available row.
+    const focusIndex =
+      lines.length > 0
+        ? Math.max(0, Math.min(index - 1, lines.length - 1))
+        : -1;
+
+    if (focusIndex >= 0) {
+      const focusLine = lines[focusIndex] ?? "";
+
+      const focusMatch = focusLine.match(
+        /^(\s*)(☐|☑)(?:\uFE0F)?(\s?)(.*)$/
+      );
+
+      // Calculate checkbox prefix length.
+      const prefixLength = focusMatch
+        ? focusMatch[1].length + 1 + focusMatch[3].length
+        : 0;
+
+      // Calculate absolute cursor position.
+      const lineStart = lines
+        .slice(0, focusIndex)
+        .reduce(
+          (total, line) => total + line.length + 1,
+          0
+        );
+
+      const cursor =
+        lineStart +
+        prefixLength +
+        (focusMatch
+          ? focusMatch[4].length
+          : focusLine.length);
+
+      setSelection({
+        start: cursor,
+        end: cursor,
+      });
+
+      // Focus previous checklist input.
+      requestAnimationFrame(() => {
+        checklistInputRefs.current[focusIndex]?.focus();
+      });
+    } else {
+      setSelection({ start: 0, end: 0 });
+    }
+  },
+  [content]
+);
+
+
+
   const handleContentChange = useCallback(
     (value: string) => {
+      let nextValue = value;
+      let nextBulletMode = isBulletMode;
+      let nextNumberedMode = isNumberedListMode;
+      let nextChecklistMode = isChecklistMode;
+      let nextListNumber = listNumber;
+
+      let cursorPosition = value.length;
+
+      if (
+        (isBulletMode || isNumberedListMode || isChecklistMode) &&
+        value.length > content.length
+      ) {
+        let newlinePosition = -1;
+
+        for (let i = 0; i < value.length; i++) {
+          if (value[i] === "\n" && content[i] !== "\n") {
+            newlinePosition = i;
+            break;
+          }
+        }
+
+        if (newlinePosition !== -1) {
+          const lineStart = content.lastIndexOf("\n", newlinePosition - 1) + 1;
+
+          const previousLine = content.slice(lineStart, newlinePosition).trim();
+
+          const isEmptyBullet = previousLine === "•";
+          const isEmptyNumberedItem = /^\d+\.$/.test(previousLine);
+          const isEmptyChecklistItem = /^(☐|☑)$/.test(previousLine);
+
+          if (isBulletMode && isEmptyBullet) {
+            nextValue =
+              content.slice(0, lineStart) + value.slice(newlinePosition + 1);
+
+            cursorPosition = lineStart;
+
+            nextBulletMode = false;
+          } else if (isNumberedListMode && isEmptyNumberedItem) {
+            nextValue =
+              content.slice(0, lineStart) + value.slice(newlinePosition + 1);
+
+            cursorPosition = lineStart;
+
+            nextNumberedMode = false;
+            nextListNumber = 1;
+          } else if (isChecklistMode && isEmptyChecklistItem) {
+            nextValue =
+              content.slice(0, lineStart) + value.slice(newlinePosition + 1);
+
+            cursorPosition = lineStart;
+
+            nextChecklistMode = false;
+          } else {
+            const insertAt = newlinePosition + 1;
+
+            if (isBulletMode) {
+              const prefix = "• ";
+
+              nextValue =
+                value.slice(0, insertAt) + prefix + value.slice(insertAt);
+
+              cursorPosition = insertAt + prefix.length;
+            } else if (isNumberedListMode) {
+              const prefix = `${nextListNumber}. `;
+
+              nextValue =
+                value.slice(0, insertAt) + prefix + value.slice(insertAt);
+
+              cursorPosition = insertAt + prefix.length;
+              nextListNumber += 1;
+            } else if (isChecklistMode) {
+              const prefix = "☐ ";
+
+              nextValue =
+                value.slice(0, insertAt) + prefix + value.slice(insertAt);
+
+              cursorPosition = insertAt + prefix.length;
+            }
+          }
+        }
+      }
+
       undoStack.current.push(content);
-      if (undoStack.current.length > 100) undoStack.current.shift();
+
+      if (undoStack.current.length > 100) {
+        undoStack.current.shift();
+      }
+
       redoStack.current = [];
-      setContent(value);
+
+      setContent(nextValue);
+      setModifiedAt(new Date().toISOString());
+
+      setIsBulletMode(nextBulletMode);
+      setIsNumberedListMode(nextNumberedMode);
+      setIsChecklistMode(nextChecklistMode);
+      setListNumber(nextListNumber);
+
+      // Update cursor after content modification
+      requestAnimationFrame(() => {
+        setSelection({
+          start: cursorPosition,
+          end: cursorPosition,
+        });
+      });
+    },
+    [content, isBulletMode, isNumberedListMode, isChecklistMode, listNumber],
+  );
+
+
+  const toggleChecklistItem = useCallback(
+  (lineIndex: number) => {
+    const lines = content.split("\n");
+
+    if (lineIndex < 0 || lineIndex >= lines.length) return;
+
+    const line = lines[lineIndex] ?? "";
+
+    const match = line.match(
+      /^(\s*)(☐|☑)(?:\uFE0F)?(\s?)(.*)$/
+    );
+
+    if (!match) return;
+
+    const nextCheckbox =
+      match[2] === "☐" ? "☑" : "☐";
+
+    lines[lineIndex] =
+      `${match[1]}${nextCheckbox}${match[3]}${match[4]}`;
+
+    const updated = lines.join("\n");
+
+    undoStack.current.push(content);
+
+    if (undoStack.current.length > 100) {
+      undoStack.current.shift();
+    }
+
+    redoStack.current = [];
+
+    setContent(updated);
+    setModifiedAt(new Date().toISOString());
+  },
+  [content]
+);
+
+  const toggleChecklistAtLine = useCallback(
+    (lineIndex: number) => {
+      const lines = content.split("\n");
+
+      if (lineIndex < 0 || lineIndex >= lines.length) return;
+
+      const line = lines[lineIndex];
+
+      const match = line.match(/^(\s*)(☐|☑)(\s*)/);
+
+      if (!match) return;
+
+      const nextCheckbox = match[2] === "☐" ? "☑" : "☐";
+
+      lines[lineIndex] =
+        match[1] + nextCheckbox + match[3] + line.slice(match[0].length);
+
+      const updated = lines.join("\n");
+
+      undoStack.current.push(content);
+      redoStack.current = [];
+
+      setContent(updated);
       setModifiedAt(new Date().toISOString());
     },
     [content],
   );
 
+  const updateChecklistLine = useCallback(
+    (lineIndex: number, nextText: string) => {
+      const lines = content.split("\n");
+      if (lineIndex < 0 || lineIndex >= lines.length) return;
+
+      const currentLine = lines[lineIndex] ?? "";
+      const checkboxPrefix = currentLine.match(/^(\s*[☐☑]\s?)/)?.[1] ?? "";
+      lines[lineIndex] = checkboxPrefix + nextText;
+
+      const updated = lines.join("\n");
+      if (updated.length > 2000) return;
+
+      undoStack.current.push(content);
+      if (undoStack.current.length > 100) undoStack.current.shift();
+      redoStack.current = [];
+
+      setContent(updated);
+      setModifiedAt(new Date().toISOString());
+    },
+    [content],
+  );
+
+
+
+  const addChecklistItemAfter = useCallback(
+    (lineIndex: number) => {
+      const lines = content.split("\n");
+      if (lineIndex < 0 || lineIndex >= lines.length) return;
+
+      const currentLine = lines[lineIndex] ?? "";
+      const match = currentLine.match(/^(\s*)(☐|☑)(?:\uFE0F)?(\s?)(.*)$/);
+
+      // Enter on an empty checkbox ends the checklist, matching the old editor behavior.
+      if (match && !match[4].trim()) {
+        lines.splice(lineIndex, 1);
+        const updated = lines.join("\n");
+
+        undoStack.current.push(content);
+        if (undoStack.current.length > 100) undoStack.current.shift();
+        redoStack.current = [];
+
+        setContent(updated);
+        setModifiedAt(new Date().toISOString());
+
+        const stillHasChecklist = lines.some((entry) =>
+          /^\s*[☐☑]\s?/.test(entry),
+        );
+        setIsChecklistMode(stillHasChecklist);
+
+        requestAnimationFrame(() => {
+          if (stillHasChecklist) {
+            checklistInputRefs.current[Math.max(0, lineIndex - 1)]?.focus();
+          } else {
+            contentInputRef.current?.focus();
+          }
+        });
+        return;
+      }
+
+      lines.splice(lineIndex + 1, 0, "☐ ");
+      const updated = lines.join("\n");
+
+      undoStack.current.push(content);
+      if (undoStack.current.length > 100) undoStack.current.shift();
+      redoStack.current = [];
+
+      setContent(updated);
+      setIsNormalTextMode(false);
+      setIsChecklistMode(true);
+      setModifiedAt(new Date().toISOString());
+
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          checklistInputRefs.current[lineIndex + 1]?.focus();
+        });
+      });
+    },
+    [content],
+  );
+
+ const checklistLines = content.split("\n");
+
+const hasChecklistItems = checklistLines.some((line) =>
+  /^\s*[☐☑](?:\uFE0F)?\s?/.test(line)
+);
+
+const showChecklistEditor =
+  isChecklistMode || hasChecklistItems;
+
+  const renderNoteWithLinks = (text: string) => {
+    const urlRegex = /https?:\/\/[^\s]+|www\.[^\s]+/gi;
+    const parts = text.split(urlRegex);
+    const urls = text.match(urlRegex) ?? [];
+
+    return (
+      <Text style={{ color: textColor, fontSize, lineHeight: lineSpacing }}>
+        {parts.map((part, index) => (
+          <React.Fragment key={`text-${index}`}>
+            {part}
+            {urls[index] ? (
+              <Text
+                key={`link-${index}`}
+                style={{
+                  color: "#1685E5",
+                  textDecorationLine: "underline",
+                }}
+                onPress={() => {
+                  const url = urls[index].startsWith("http")
+                    ? urls[index]
+                    : `https://${urls[index]}`;
+
+                  Linking.openURL(url).catch(() => {
+                    showAlert("Error", "Unable to open this link.");
+                  });
+                }}
+              >
+                {urls[index]}
+              </Text>
+            ) : null}
+          </React.Fragment>
+        ))}
+      </Text>
+    );
+  };
+
   const replaceSelection = useCallback(
     (insert: string, wrap = false) => {
       const start = Math.max(0, Math.min(selection.start, content.length));
+
       const end = Math.max(start, Math.min(selection.end, content.length));
+
       const selected = content.slice(start, end);
 
       const value = wrap
@@ -824,14 +1910,22 @@ export default function TodolistScreen() {
 
       undoStack.current.push(content);
       redoStack.current = [];
-      setContent(value);
 
       const cursor = wrap
         ? start + insert.length + selected.length + insert.length
         : start + insert.length;
 
-      setSelection({ start: cursor, end: cursor });
+      setContent(value);
       setModifiedAt(new Date().toISOString());
+
+      requestAnimationFrame(() => {
+        setSelection({
+          start: cursor,
+          end: cursor,
+        });
+
+        contentInputRef.current?.focus();
+      });
     },
     [content, selection],
   );
@@ -950,7 +2044,7 @@ export default function TodolistScreen() {
 
   const copyContent = useCallback(async () => {
     await Clipboard.setStringAsync(content);
-    Alert.alert("Copied", "Note text copied to clipboard.");
+    showAlert("Copied", "Note text copied to clipboard.");
   }, [content]);
 
   const cutSelection = useCallback(async () => {
@@ -970,20 +2064,8 @@ export default function TodolistScreen() {
   }, [content, selection]);
 
   const pasteContent = useCallback(async () => {
-    try {
-      const pasted = await Clipboard.getStringAsync();
-
-      if (pasted) {
-        replaceSelection(pasted);
-      }
-    } catch (error) {
-      console.warn("Clipboard access failed:", error);
-
-      Alert.alert(
-        "Clipboard unavailable",
-        "Clipboard access was denied. Please allow clipboard access or paste your text manually.",
-      );
-    }
+    const pasted = await Clipboard.getStringAsync();
+    if (pasted) replaceSelection(pasted);
   }, [replaceSelection]);
 
   const insertHyperlink = useCallback(() => {
@@ -993,43 +2075,114 @@ export default function TodolistScreen() {
 
   const handleInsertLink = useCallback(() => {
     const url = linkUrl.trim();
+
     if (!url) {
-      Alert.alert("Invalid URL", "Please enter a URL.");
+      showAlert("Insert link", "Please enter a URL.");
       return;
     }
-    const formattedUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-    replaceSelection(formattedUrl);
-    setLinkModalVisible(false);
-    setLinkUrl("");
-  }, [linkUrl, replaceSelection]);
 
-  const openFirstHyperlink = useCallback(async () => {
-    const match = content.match(/https?:\/\/[^\s)]+/i);
-    if (!match) {
-      Alert.alert(
-        "No hyperlink",
+    const normalizedUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+
+    const start = Math.max(0, Math.min(selection.start, content.length));
+    const end = Math.max(start, Math.min(selection.end, content.length));
+
+    const updatedContent =
+      content.slice(0, start) + normalizedUrl + content.slice(end);
+
+    handleContentChange(updatedContent);
+
+    const cursorPosition = start + normalizedUrl.length;
+    setSelection({
+      start: cursorPosition,
+      end: cursorPosition,
+    });
+
+    setLinkUrl("");
+    setLinkModalVisible(false);
+  }, [linkUrl, selection, content, handleContentChange]);
+
+  const renderLinkedText = (text: string) => {
+    const parts = text.split(/(https?:\/\/[^\s]+|www\.[^\s]+)/gi);
+
+    return (
+      <Text
+        style={{
+          fontSize,
+          color: textColor,
+          fontFamily:
+            !fontFamily || fontFamily === "System" ? undefined : fontFamily,
+        }}
+      >
+        {parts.map((part, index) => {
+          const isUrl = /^(https?:\/\/|www\.)/i.test(part);
+
+          return (
+            <Text
+              key={index}
+              style={
+                isUrl
+                  ? {
+                      color: "#1685E5",
+                      textDecorationLine: "underline",
+                    }
+                  : { color: textColor }
+              }
+            >
+              {part}
+            </Text>
+          );
+        })}
+      </Text>
+    );
+  };
+
+  const openFirstHyperlink = useCallback(() => {
+    const matches = content.match(/https?:\/\/[^\s<>"')\]]+/gi) || [];
+
+    const uniqueLinks = [
+      ...new Set(matches.map((url) => url.replace(/[.,!?;:]+$/, ""))),
+    ];
+
+    if (uniqueLinks.length === 0) {
+      showAlert(
+        "No hyperlinks",
         "Add a URL such as https://example.com first.",
       );
       return;
     }
-    try {
-      await Linking.openURL(match[0]);
-    } catch {
-      Alert.alert("Unable to open link", match[0]);
+
+    if (uniqueLinks.length === 1) {
+      Linking.openURL(uniqueLinks[0]).catch(() => {
+        showAlert("Unable to open link", uniqueLinks[0]);
+      });
+      return;
     }
+
+    setHyperlinkList(uniqueLinks);
+    setSelectedHyperlink(null);
+    setHyperlinkModalVisible(true);
   }, [content]);
 
   useEffect(() => {
     let active = true;
+
+    // A different draft key means the user is creating/opening another note.
+    // Re-enable auto-save for that new draft only.
+    if (activeDraftKeyRef.current !== draftKey) {
+      activeDraftKeyRef.current = draftKey;
+      skipDraftAutoSaveRef.current = false;
+    }
+
     const restoreDraft = async () => {
       try {
         const raw = await AsyncStorage.getItem(draftKey);
+
         if (!active) return;
 
-        // Apply the default selected in Settings to a genuinely new note.
-        // Existing notes, template backgrounds, and non-empty local drafts keep
-        // their own saved appearance.
         let shouldApplyDefaultTheme = !isEditing && !hasIncomingTemplate;
+
+        let restoredDraft = false;
+
         if (raw && !hasIncomingTemplate) {
           const draft = JSON.parse(raw) as {
             title?: string;
@@ -1039,9 +2192,22 @@ export default function TodolistScreen() {
             isQuickNote?: boolean;
             quickNoteColor?: string;
             quickNotePinned?: boolean;
-            notePattern?: "plain" | "lined" | "dotted" | "grid";
+            notePattern?: string;
+            notebookStyle?: "classic" | "minimal" | "journal";
+            noteTextSize?: "small" | "medium" | "large";
+            noteCornerStyle?: "square" | "rounded" | "soft";
+            alignment?: "left" | "center" | "right";
             drawingUri?: string;
             drawingText?: string;
+            imageUris?: string[];
+            videoUris?: string[];
+            attachedFiles?: Array<{
+              uri: string;
+              name: string;
+              mimeType?: string;
+              size?: number;
+              lastModified?: number;
+            }>;
             noteBackgroundImageUri?: string | null;
           };
 
@@ -1049,32 +2215,123 @@ export default function TodolistScreen() {
             (typeof draft.title === "string" && draft.title.trim()) ||
             (typeof draft.content === "string" && draft.content.trim()),
           );
+
           shouldApplyDefaultTheme = shouldApplyDefaultTheme && !draftHasContent;
 
           if (!isEditing || (!title && !content)) {
-            if (typeof draft.title === "string") setTitle(draft.title);
-            if (typeof draft.content === "string") setContent(draft.content);
-            if (typeof draft.createdAt === "string")
+            if (typeof draft.title === "string") {
+              setTitle(draft.title);
+            }
+
+            if (typeof draft.content === "string") {
+              setContent(draft.content);
+            }
+
+            if (["left", "center", "right"].includes(draft.alignment || "")) {
+              setAlignment(draft.alignment as "left" | "center" | "right");
+            }
+
+            if (typeof draft.createdAt === "string") {
               setCreatedAt(draft.createdAt);
-            if (typeof draft.modifiedAt === "string")
+            }
+
+            if (typeof draft.modifiedAt === "string") {
               setModifiedAt(draft.modifiedAt);
-            if (typeof draft.quickNoteColor === "string")
+            }
+
+            if (typeof draft.quickNoteColor === "string") {
               setQuickNoteColor(draft.quickNoteColor);
-            if (typeof draft.quickNotePinned === "boolean")
+            }
+
+            if (typeof draft.quickNotePinned === "boolean") {
               setQuickNotePinned(draft.quickNotePinned);
+            }
+
             if (
-              draft.notePattern === "plain" ||
-              draft.notePattern === "lined" ||
-              draft.notePattern === "dotted" ||
-              draft.notePattern === "grid"
-            )
-              setNotePattern(draft.notePattern);
-            if (typeof draft.drawingUri === "string")
+              typeof draft.notePattern === "string" &&
+              draft.notePattern.trim().length > 0
+            ) {
+              setNotePattern(draft.notePattern.trim().toLowerCase());
+            }
+
+            if (
+              ["classic", "minimal", "journal"].includes(
+                draft.notebookStyle || "",
+              )
+            ) {
+              setDefaultNotebookStyle(
+                draft.notebookStyle as "classic" | "minimal" | "journal",
+              );
+            }
+
+            if (
+              ["small", "medium", "large"].includes(draft.noteTextSize || "")
+            ) {
+              const size = draft.noteTextSize as "small" | "medium" | "large";
+              setDefaultNoteTextSize(size);
+              setFontSize(size === "small" ? 14 : size === "large" ? 22 : 18);
+              setLineSpacing(
+                size === "small" ? 22 : size === "large" ? 34 : 28,
+              );
+            }
+
+            if (
+              ["square", "rounded", "soft"].includes(
+                draft.noteCornerStyle || "",
+              )
+            ) {
+              setDefaultNoteCornerStyle(
+                draft.noteCornerStyle as "square" | "rounded" | "soft",
+              );
+            }
+
+            if (typeof draft.drawingUri === "string") {
               setDrawingUri(draft.drawingUri);
-            if (typeof draft.drawingText === "string")
+            }
+
+            if (typeof draft.drawingText === "string") {
               setDrawingText(draft.drawingText);
-            if (typeof draft.noteBackgroundImageUri === "string")
+            }
+
+            if (Array.isArray(draft.imageUris)) {
+              setImageUris(
+                draft.imageUris.filter(
+                  (uri): uri is string => typeof uri === "string",
+                ),
+              );
+            }
+
+            if (Array.isArray(draft.videoUris)) {
+              setVideoUris(
+                draft.videoUris.filter(
+                  (uri): uri is string => typeof uri === "string",
+                ),
+              );
+            }
+
+            if (Array.isArray(draft.attachedFiles)) {
+              setAttachedFiles(
+                draft.attachedFiles
+                  .filter(
+                    (file) =>
+                      file &&
+                      typeof file.uri === "string" &&
+                      typeof file.name === "string",
+                  )
+                  .map((file) => ({
+                    ...file,
+                    mimeType: file.mimeType,
+                    size: file.size,
+                    lastModified: file.lastModified,
+                  })) as DocumentPicker.DocumentPickerAsset[],
+              );
+            }
+
+            if (typeof draft.noteBackgroundImageUri === "string") {
               setNoteBackgroundImageUri(draft.noteBackgroundImageUri);
+            }
+
+            restoredDraft = true;
           }
         }
 
@@ -1082,7 +2339,9 @@ export default function TodolistScreen() {
           try {
             const savedDefaultTheme =
               await AsyncStorage.getItem("defaultNoteTheme");
+
             if (!active) return;
+
             if (savedDefaultTheme) {
               const defaultTheme = JSON.parse(savedDefaultTheme) as {
                 color?: string;
@@ -1091,63 +2350,95 @@ export default function TodolistScreen() {
                 textSize?: string;
                 cornerStyle?: string;
               };
+
+              // Apply default paper color
               if (
                 typeof defaultTheme.color === "string" &&
                 /^#[0-9A-Fa-f]{6}$/.test(defaultTheme.color)
               ) {
                 setQuickNoteColor(defaultTheme.color);
-                setNoteBackgroundImageUri(null);
               }
-              if (
-                defaultTheme.pattern === "plain" ||
-                defaultTheme.pattern === "lined" ||
-                defaultTheme.pattern === "dotted" ||
-                defaultTheme.pattern === "grid"
-              ) {
-                setNotePattern(defaultTheme.pattern);
+
+              // Apply default paper pattern
+              if (typeof defaultTheme.pattern === "string") {
+                const pattern = defaultTheme.pattern.trim().toLowerCase();
+
+                if (pattern) {
+                  setNotePattern(pattern);
+                  setPendingNotePattern(pattern);
+                }
               }
+
+              // Apply notebook style
               if (
-                defaultTheme.notebookStyle === "classic" ||
-                defaultTheme.notebookStyle === "minimal" ||
-                defaultTheme.notebookStyle === "journal"
+                ["classic", "minimal", "journal"].includes(
+                  defaultTheme.notebookStyle || "",
+                )
               ) {
-                setDefaultNotebookStyle(defaultTheme.notebookStyle);
-              }
-              if (
-                defaultTheme.textSize === "small" ||
-                defaultTheme.textSize === "medium" ||
-                defaultTheme.textSize === "large"
-              ) {
-                setDefaultNoteTextSize(defaultTheme.textSize);
-                setFontSize(
-                  defaultTheme.textSize === "small"
-                    ? 14
-                    : defaultTheme.textSize === "large"
-                      ? 22
-                      : 18,
+                setDefaultNotebookStyle(
+                  defaultTheme.notebookStyle as
+                    | "classic"
+                    | "minimal"
+                    | "journal",
                 );
               }
+
+              // Apply text size
               if (
-                defaultTheme.cornerStyle === "square" ||
-                defaultTheme.cornerStyle === "rounded" ||
-                defaultTheme.cornerStyle === "soft"
+                ["small", "medium", "large"].includes(
+                  defaultTheme.textSize || "",
+                )
               ) {
-                setDefaultNoteCornerStyle(defaultTheme.cornerStyle);
+                const size = defaultTheme.textSize as
+                  | "small"
+                  | "medium"
+                  | "large";
+
+                setDefaultNoteTextSize(size);
+
+                setFontSize(size === "small" ? 14 : size === "large" ? 22 : 18);
+                setLineSpacing(
+                  size === "small" ? 22 : size === "large" ? 34 : 28,
+                );
               }
+
+              // Apply corner style
+              if (
+                ["square", "rounded", "soft"].includes(
+                  defaultTheme.cornerStyle || "",
+                )
+              ) {
+                setDefaultNoteCornerStyle(
+                  defaultTheme.cornerStyle as "square" | "rounded" | "soft",
+                );
+              }
+
+              // New note should not inherit an old background image
+              setNoteBackgroundImageUri(null);
             }
+
             const savedAccent = await AsyncStorage.getItem("app-accent-color");
-            if (savedAccent && /^#[0-9A-Fa-f]{6}$/.test(savedAccent))
+
+            if (!active) return;
+
+            if (savedAccent && /^#[0-9A-Fa-f]{6}$/.test(savedAccent)) {
               setPersonalAccentColor(savedAccent);
+            }
           } catch (themeError) {
             console.warn("Unable to load default note theme:", themeError);
           }
         }
 
+        if (!active) return;
+
         draftLoaded.current = true;
         setDraftReady(true);
-        setDraftStatus("saved");
+
+        // Set status based on whether a draft was restored.
+        setDraftStatus(restoredDraft ? "saved" : "idle");
       } catch (error) {
         console.warn("Unable to restore local note draft:", error);
+
         if (active) {
           draftLoaded.current = true;
           setDraftReady(true);
@@ -1158,6 +2449,7 @@ export default function TodolistScreen() {
 
     setDraftReady(false);
     draftLoaded.current = false;
+
     void restoreDraft();
 
     return () => {
@@ -1167,35 +2459,80 @@ export default function TodolistScreen() {
 
   useEffect(() => {
     if (!draftReady || !draftLoaded.current) return;
+    if (skipDraftAutoSaveRef.current) return;
+
     setDraftStatus("saving");
 
     const timer = setTimeout(async () => {
+      draftSaveTimerRef.current = null;
+
+      // A save/delete may have completed while this timeout was waiting.
+      if (skipDraftAutoSaveRef.current) return;
+
+      const draftValue = JSON.stringify({
+        title,
+        content,
+        createdAt,
+        modifiedAt,
+        isQuickNote,
+        quickNoteColor,
+        quickNotePinned,
+        notePattern,
+        notebookStyle: defaultNotebookStyle,
+        noteTextSize: defaultNoteTextSize,
+        noteCornerStyle: defaultNoteCornerStyle,
+        alignment,
+        drawingUri,
+        drawingText,
+        imageUris,
+        videoUris,
+        attachedFiles: attachedFiles.map((file) => ({
+          uri: file.uri,
+          name: file.name,
+          mimeType: file.mimeType,
+          size: file.size,
+          lastModified: file.lastModified,
+        })),
+        noteBackgroundImageUri,
+        savedAt: new Date().toISOString(),
+      });
+
+      const writePromise = (async () => {
+        try {
+          // Check again immediately before writing.
+          if (skipDraftAutoSaveRef.current) return;
+
+          await AsyncStorage.setItem(draftKey, draftValue);
+
+          if (!skipDraftAutoSaveRef.current) {
+            setDraftStatus("saved");
+          }
+        } catch (error) {
+          console.error("Unable to auto-save note draft:", error);
+          if (!skipDraftAutoSaveRef.current) {
+            setDraftStatus("error");
+          }
+        }
+      })();
+
+      draftWriteInFlightRef.current = writePromise;
       try {
-        await AsyncStorage.setItem(
-          draftKey,
-          JSON.stringify({
-            title,
-            content,
-            createdAt,
-            modifiedAt,
-            isQuickNote,
-            quickNoteColor,
-            quickNotePinned,
-            notePattern,
-            drawingUri,
-            drawingText,
-            noteBackgroundImageUri,
-            savedAt: new Date().toISOString(),
-          }),
-        );
-        setDraftStatus("saved");
-      } catch (error) {
-        console.error("Unable to auto-save note draft:", error);
-        setDraftStatus("error");
+        await writePromise;
+      } finally {
+        if (draftWriteInFlightRef.current === writePromise) {
+          draftWriteInFlightRef.current = null;
+        }
       }
     }, 500);
 
-    return () => clearTimeout(timer);
+    draftSaveTimerRef.current = timer;
+
+    return () => {
+      clearTimeout(timer);
+      if (draftSaveTimerRef.current === timer) {
+        draftSaveTimerRef.current = null;
+      }
+    };
   }, [
     draftKey,
     draftReady,
@@ -1207,9 +2544,17 @@ export default function TodolistScreen() {
     quickNoteColor,
     quickNotePinned,
     notePattern,
+    defaultNotebookStyle,
+    defaultNoteTextSize,
+    defaultNoteCornerStyle,
+    alignment,
     drawingUri,
     drawingText,
+    imageUris,
+    videoUris,
     noteBackgroundImageUri,
+    existingAttachments,
+    attachedFiles,
   ]);
 
   const isRecording = Boolean(recorderState.isRecording);
@@ -1242,7 +2587,7 @@ export default function TodolistScreen() {
         setToken(storedToken || "");
       } catch (error) {
         if (active) {
-          Alert.alert("Authentication error", getErrorMessage(error));
+          showAlert("Authentication error", getErrorMessage(error));
         }
       } finally {
         if (active) setInitializing(false);
@@ -1255,13 +2600,18 @@ export default function TodolistScreen() {
   }, []);
 
   useEffect(() => {
+    // Native notification permissions are unavailable in the Electron web runtime.
+    if (Platform.OS === "web") return;
+
     const requestPermission = async () => {
       try {
         const permissions = await Notifications.getPermissionsAsync();
         if (!permissions.granted) {
           await Notifications.requestPermissionsAsync();
         }
-      } catch {}
+      } catch (error) {
+        console.warn("[Notifications] Permission request unavailable:", error);
+      }
     };
     void requestPermission();
   }, []);
@@ -1270,6 +2620,12 @@ export default function TodolistScreen() {
     if (!isEditing || !passedTodo) return;
     setTitle(passedTodo.title || "");
     setContent(passedTodo.text || "");
+    if (["left", "center", "right"].includes(passedTodo.alignment || "")) {
+      setAlignment(passedTodo.alignment as "left" | "center" | "right");
+    } else {
+      setAlignment("left");
+    }
+    setExistingAttachments(getExistingAttachments(passedTodo));
     if (
       typeof passedTodo.backgroundImageUrl === "string" &&
       passedTodo.backgroundImageUrl
@@ -1279,6 +2635,38 @@ export default function TodolistScreen() {
     if (typeof passedTodo.quickNoteColor === "string")
       setQuickNoteColor(passedTodo.quickNoteColor);
     if (passedTodo.notePattern) setNotePattern(passedTodo.notePattern);
+    if (
+      passedTodo.notebookStyle &&
+      ["classic", "minimal", "journal"].includes(passedTodo.notebookStyle)
+    ) {
+      setDefaultNotebookStyle(passedTodo.notebookStyle);
+    }
+    if (
+      passedTodo.noteTextSize &&
+      ["small", "medium", "large"].includes(passedTodo.noteTextSize)
+    ) {
+      setDefaultNoteTextSize(passedTodo.noteTextSize);
+      setFontSize(
+        passedTodo.noteTextSize === "small"
+          ? 14
+          : passedTodo.noteTextSize === "large"
+            ? 22
+            : 18,
+      );
+      setLineSpacing(
+        passedTodo.noteTextSize === "small"
+          ? 22
+          : passedTodo.noteTextSize === "large"
+            ? 34
+            : 28,
+      );
+    }
+    if (
+      passedTodo.noteCornerStyle &&
+      ["square", "rounded", "soft"].includes(passedTodo.noteCornerStyle)
+    ) {
+      setDefaultNoteCornerStyle(passedTodo.noteCornerStyle);
+    }
     const parsedDate = passedTodo.date ? new Date(passedTodo.date) : new Date();
     const validDate = Number.isNaN(parsedDate.getTime())
       ? new Date()
@@ -1352,9 +2740,16 @@ export default function TodolistScreen() {
             quickNoteColor?: string;
             quickNotePinned?: boolean;
             backgroundImageUri?: string;
-            notePattern?: "plain" | "lined" | "dotted" | "grid";
+            notePattern?: string;
+            notebookStyle?: "classic" | "minimal" | "journal";
+            noteTextSize?: "small" | "medium" | "large";
+            noteCornerStyle?: "square" | "rounded" | "soft";
+            alignment?: "left" | "center" | "right";
           };
           if (!active) return;
+          if (["left", "center", "right"].includes(meta.alignment || "")) {
+            setAlignment(meta.alignment as "left" | "center" | "right");
+          }
           if (typeof meta.quickNoteColor === "string")
             setQuickNoteColor(meta.quickNoteColor);
           if (typeof meta.quickNotePinned === "boolean")
@@ -1364,13 +2759,41 @@ export default function TodolistScreen() {
             meta.backgroundImageUri
           )
             setNoteBackgroundImageUri(meta.backgroundImageUri);
+          if (typeof meta.notePattern === "string" && meta.notePattern.trim()) {
+            setNotePattern(meta.notePattern.trim().toLowerCase());
+          }
           if (
-            meta.notePattern === "plain" ||
-            meta.notePattern === "lined" ||
-            meta.notePattern === "dotted" ||
-            meta.notePattern === "grid"
-          )
-            setNotePattern(meta.notePattern);
+            meta.notebookStyle &&
+            ["classic", "minimal", "journal"].includes(meta.notebookStyle)
+          ) {
+            setDefaultNotebookStyle(meta.notebookStyle);
+          }
+          if (
+            meta.noteTextSize &&
+            ["small", "medium", "large"].includes(meta.noteTextSize)
+          ) {
+            setDefaultNoteTextSize(meta.noteTextSize);
+            setFontSize(
+              meta.noteTextSize === "small"
+                ? 14
+                : meta.noteTextSize === "large"
+                  ? 22
+                  : 18,
+            );
+            setLineSpacing(
+              meta.noteTextSize === "small"
+                ? 22
+                : meta.noteTextSize === "large"
+                  ? 34
+                  : 28,
+            );
+          }
+          if (
+            meta.noteCornerStyle &&
+            ["square", "rounded", "soft"].includes(meta.noteCornerStyle)
+          ) {
+            setDefaultNoteCornerStyle(meta.noteCornerStyle);
+          }
           return;
         }
       } catch (error) {
@@ -1401,7 +2824,7 @@ export default function TodolistScreen() {
         );
 
         if (!response.data?.success || !payload) {
-          Alert.alert(
+          showAlert(
             "Unable to load",
             "Todo was not found. Please return to the list and open Edit again.",
           );
@@ -1410,9 +2833,47 @@ export default function TodolistScreen() {
 
         setTitle(payload.title || "");
         setContent(payload.text || "");
+        if (["left", "center", "right"].includes(payload.alignment || "")) {
+          setAlignment(payload.alignment as "left" | "center" | "right");
+        } else {
+          setAlignment("left");
+        }
+        setExistingAttachments(getExistingAttachments(payload));
         setNoteBackgroundImageUri(payload.backgroundImageUrl || null);
         if (payload.quickNoteColor) setQuickNoteColor(payload.quickNoteColor);
         if (payload.notePattern) setNotePattern(payload.notePattern);
+        if (
+          payload.notebookStyle &&
+          ["classic", "minimal", "journal"].includes(payload.notebookStyle)
+        ) {
+          setDefaultNotebookStyle(payload.notebookStyle);
+        }
+        if (
+          payload.noteTextSize &&
+          ["small", "medium", "large"].includes(payload.noteTextSize)
+        ) {
+          setDefaultNoteTextSize(payload.noteTextSize);
+          setFontSize(
+            payload.noteTextSize === "small"
+              ? 14
+              : payload.noteTextSize === "large"
+                ? 22
+                : 18,
+          );
+          setLineSpacing(
+            payload.noteTextSize === "small"
+              ? 22
+              : payload.noteTextSize === "large"
+                ? 34
+                : 28,
+          );
+        }
+        if (
+          payload.noteCornerStyle &&
+          ["square", "rounded", "soft"].includes(payload.noteCornerStyle)
+        ) {
+          setDefaultNoteCornerStyle(payload.noteCornerStyle);
+        }
         const parsedDate = payload.date ? new Date(payload.date) : new Date();
         const validDate = Number.isNaN(parsedDate.getTime())
           ? new Date()
@@ -1439,11 +2900,17 @@ export default function TodolistScreen() {
             : "none",
         );
 
-        setImageUri(null);
+        setImageUris([]);
+        setVideoUris([]);
+        webImageFiles.forEach(({ uri }) => URL.revokeObjectURL(uri));
+        webVideoFiles.forEach(({ uri }) => URL.revokeObjectURL(uri));
+        setWebImageFiles([]);
+        setWebVideoFiles([]);
+        setAttachedFiles([]);
         setVoiceUri(null);
       } catch (error) {
         if (active) {
-          Alert.alert("Load failed", getErrorMessage(error));
+          showAlert("Load failed", getErrorMessage(error));
         }
       }
     };
@@ -1467,6 +2934,7 @@ export default function TodolistScreen() {
 
   // When launched from a selected calendar day, link the new note to that date.
   const calendarDateApplied = useRef(false);
+
   useEffect(() => {
     const rawSelectedDate = Array.isArray(params.selectedDate)
       ? params.selectedDate[0]
@@ -1492,50 +2960,103 @@ export default function TodolistScreen() {
     applyDate(linkedDate);
   }, [params.selectedDate, isEditing, applyDate]);
 
-  const openDatePicker = useCallback(() => {
-    const initialDate =
-      dueDateTime && !Number.isNaN(dueDateTime.getTime())
-        ? dueDateTime
-        : parseDateText(dateText) || new Date();
-
-    if (Platform.OS === "android") {
-      DateTimePickerAndroid.open({
-        value: initialDate,
-        mode: "date",
-        display: "calendar",
-        onChange: (event, selectedDate) => {
-          if (event.type !== "set" || !selectedDate) return;
-
-          const selected = new Date(selectedDate);
-          selected.setHours(
-            initialDate.getHours(),
-            initialDate.getMinutes(),
-            0,
-            0,
-          );
-
-          const value = toDateInput(selected);
-          setTodoDate(value);
-          setDateText(value);
-          setDueDateTime(selected);
-        },
-      });
-      return;
-    }
-
-    // Electron / desktop web
-    setDesktopPickerMode("due");
-    setShowDesktopDatePicker(true);
-  }, [dateText, dueDateTime]);
-
-  const toLocalDateTimeInput = (date: Date) => {
+  // Web/Electron uses the browser datetime-local picker.
+  // Android continues to use the native DateTimePickerAndroid dialogs.
+  const formatLocalDateTime = (date: Date) => {
     const pad = (value: number) => String(value).padStart(2, "0");
-
-    return (
-      `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
-      `T${pad(date.getHours())}:${pad(date.getMinutes())}`
-    );
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
   };
+
+  const openWebDateTimePicker = useCallback(
+    (
+      initialDate: Date,
+      title: string,
+      onSelected: (selectedDate: Date) => void,
+    ) => {
+      if (Platform.OS !== "web" || typeof document === "undefined") return;
+
+      const now = new Date();
+      const input = document.createElement("input");
+      input.type = "datetime-local";
+      input.step = "60";
+      input.min = formatLocalDateTime(now);
+      input.value = formatLocalDateTime(initialDate);
+      input.setAttribute("aria-label", title);
+
+      // Keep the control visible so Chromium/Electron can open its native picker.
+      input.style.cssText = `
+        position: fixed;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: 280px;
+        height: 48px;
+        padding: 8px;
+        opacity: 1;
+        z-index: 999999;
+        background: #FFFFFF;
+        border: 1px solid #16866A;
+        border-radius: 8px;
+        color: #183B32;
+      `;
+
+      document.body.appendChild(input);
+
+      let cleaned = false;
+      const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        input.removeEventListener("change", handleChange);
+        input.removeEventListener("cancel", cleanup);
+        input.remove();
+      };
+
+      const handleChange = () => {
+        if (!input.value) {
+          cleanup();
+          return;
+        }
+
+        // datetime-local is local time; this preserves the user's local selection.
+        const selectedDate = new Date(input.value);
+        if (
+          Number.isNaN(selectedDate.getTime()) ||
+          selectedDate.getTime() <= Date.now()
+        ) {
+          window.alert(`Please select a future ${title.toLowerCase()}.`);
+          cleanup();
+          return;
+        }
+
+        onSelected(selectedDate);
+        cleanup();
+      };
+
+      input.addEventListener("change", handleChange);
+      input.addEventListener("cancel", cleanup);
+      input.focus();
+
+      try {
+        if (typeof input.showPicker === "function") {
+          input.showPicker();
+        } else {
+          input.click();
+        }
+      } catch (error) {
+        console.warn(
+          `[${title}] showPicker unavailable; using click fallback.`,
+          error,
+        );
+        try {
+          input.click();
+        } catch (fallbackError) {
+          console.error(`[${title}] Could not open picker:`, fallbackError);
+          cleanup();
+        }
+      }
+    },
+    [],
+  );
 
   const setQuickDate = useCallback(
     (offset: number) => {
@@ -1547,122 +3068,433 @@ export default function TodolistScreen() {
     [applyDate],
   );
 
+  const openDatePicker = useCallback(() => {
+    const now = new Date();
+
+    const current =
+      dueDateTime instanceof Date && !Number.isNaN(dueDateTime.getTime())
+        ? new Date(dueDateTime)
+        : now;
+
+    // Web / Electron
+    if (Platform.OS === "web") {
+      openWebDateTimePicker(current, "Due date and time", (selectedDate) => {
+        setDueDateTime(selectedDate);
+
+        const formatted = toDateInput(selectedDate);
+        setTodoDate(formatted);
+        setDateText(formatted);
+      });
+      return;
+    }
+
+    // Native picker is supported only on Android.
+    // Never call DateTimePickerAndroid from Electron/Web or iOS.
+    if (Platform.OS !== "android") {
+      return;
+    }
+
+    // Android native date and time picker
+    DateTimePickerAndroid.open({
+      value: current < now ? now : current,
+      mode: "date",
+      minimumDate: now,
+      is24Hour: true,
+
+      onChange: (dateEvent, selectedDate) => {
+        if (dateEvent.type !== "set" || !selectedDate) {
+          return;
+        }
+
+        const selectedDay = new Date(selectedDate);
+        const today = new Date();
+
+        // Prevent selecting a past date
+        if (selectedDay.toDateString() === today.toDateString()) {
+          selectedDay.setHours(
+            Math.max(selectedDay.getHours(), today.getHours()),
+            selectedDay.getHours() === today.getHours()
+              ? Math.max(selectedDay.getMinutes(), today.getMinutes())
+              : selectedDay.getMinutes(),
+            0,
+            0,
+          );
+        }
+
+        DateTimePickerAndroid.open({
+          value: selectedDay,
+          mode: "time",
+          is24Hour: true,
+
+          onChange: (timeEvent, selectedTime) => {
+            if (timeEvent.type !== "set" || !selectedTime) {
+              return;
+            }
+
+            const finalDate = new Date(selectedDay);
+            finalDate.setHours(
+              selectedTime.getHours(),
+              selectedTime.getMinutes(),
+              0,
+              0,
+            );
+
+            if (finalDate.getTime() <= Date.now()) {
+              showAlert(
+                "Invalid due date",
+                "Please select a future date and time.",
+              );
+              return;
+            }
+
+            setDueDateTime(finalDate);
+
+            const formatted = toDateInput(finalDate);
+            setTodoDate(formatted);
+            setDateText(formatted);
+          },
+        });
+      },
+    });
+  }, [
+    dueDateTime,
+    openWebDateTimePicker,
+    setDueDateTime,
+    setTodoDate,
+    setDateText,
+  ]);
+
   const openReminderPicker = useCallback(() => {
     const now = new Date();
 
     const initialDate =
-      alarmDate && alarmDate.getTime() > now.getTime()
-        ? alarmDate
+      alarmDate instanceof Date &&
+      !Number.isNaN(alarmDate.getTime()) &&
+      alarmDate.getTime() > now.getTime()
+        ? new Date(alarmDate)
         : new Date(now.getTime() + 60 * 60 * 1000);
 
-    if (Platform.OS !== "android") {
-      const pad = (value: number) => String(value).padStart(2, "0");
-
-      setDesktopReminderDate(
-        `${initialDate.getFullYear()}-${pad(initialDate.getMonth() + 1)}-${pad(
-          initialDate.getDate(),
-        )}`,
+    // Web / Electron: use the HTML datetime-local picker.
+    if (Platform.OS === "web") {
+      openWebDateTimePicker(
+        initialDate,
+        "Reminder date and time",
+        (selectedDate) => {
+          setAlarmDate(selectedDate);
+          setModifiedAt(new Date().toISOString());
+        },
       );
-
-      setDesktopReminderTime(
-        `${pad(initialDate.getHours())}:${pad(initialDate.getMinutes())}`,
-      );
-
-      setShowDesktopReminderPicker(true);
       return;
     }
 
+    // DateTimePickerAndroid is Android-only.
+    if (Platform.OS !== "android") {
+      return;
+    }
+
+    // Android: open the native date picker first.
     DateTimePickerAndroid.open({
       value: initialDate,
       mode: "date",
-      display: "calendar",
-      minimumDate: new Date(),
+      minimumDate: now,
+      is24Hour: true,
+      onChange: (dateEvent, selectedDate) => {
+        if (dateEvent.type !== "set" || !selectedDate) {
+          return;
+        }
 
-      onChange: (event, selectedDate) => {
-        if (event.type !== "set" || !selectedDate) return;
-
-        const chosenDate = new Date(selectedDate);
-        chosenDate.setHours(
+        // Keep the chosen calendar day and preserve the existing reminder time.
+        const selectedDay = new Date(selectedDate);
+        selectedDay.setHours(
           initialDate.getHours(),
           initialDate.getMinutes(),
           0,
           0,
         );
 
-        setTimeout(() => {
-          DateTimePickerAndroid.open({
-            value: chosenDate,
-            mode: "time",
-            display: "clock",
+        // Then open the native time picker.
+        DateTimePickerAndroid.open({
+          value: selectedDay,
+          mode: "time",
+          is24Hour: true,
+          onChange: (timeEvent, selectedTime) => {
+            if (timeEvent.type !== "set" || !selectedTime) {
+              return;
+            }
 
-            onChange: (timeEvent, selectedTime) => {
-              if (timeEvent.type !== "set" || !selectedTime) return;
+            const finalDate = new Date(selectedDay);
+            finalDate.setHours(
+              selectedTime.getHours(),
+              selectedTime.getMinutes(),
+              0,
+              0,
+            );
 
-              const result = new Date(chosenDate);
-              result.setHours(
-                selectedTime.getHours(),
-                selectedTime.getMinutes(),
-                0,
-                0,
+            if (finalDate.getTime() <= Date.now()) {
+              showAlert(
+                "Invalid reminder",
+                "Please select a future date and time.",
               );
+              return;
+            }
 
-              if (result.getTime() <= Date.now()) {
-                Alert.alert(
-                  "Choose a future time",
-                  "The reminder must be scheduled in the future.",
-                );
-                return;
-              }
-
-              setAlarmDate(result);
-
-              Alert.alert(
-                "Reminder selected",
-                `${result.toLocaleDateString()} at ${result.toLocaleTimeString(
-                  [],
-                  { hour: "2-digit", minute: "2-digit" },
-                )}\n\nSave the Todo to confirm your reminder.`,
-              );
-            },
-          });
-        }, 250);
+            setAlarmDate(finalDate);
+            setModifiedAt(new Date().toISOString());
+          },
+        });
       },
     });
-  }, [alarmDate]);
+  }, [alarmDate, openWebDateTimePicker, setAlarmDate, setModifiedAt]);
+
+  const openDesktopFilePicker = useCallback(
+    (accept: string, onFilesSelected: (files: File[]) => void) => {
+      if (Platform.OS !== "web" || typeof document === "undefined") {
+        return;
+      }
+
+      // Chromium/Electron opens the native Windows file dialog for this input.
+      // Keep the input in the DOM until selection/cancel has completed.
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = accept;
+      input.multiple = true;
+      input.setAttribute("aria-hidden", "true");
+      input.style.position = "fixed";
+      input.style.left = "-10000px";
+      input.style.top = "0";
+      input.style.width = "1px";
+      input.style.height = "1px";
+      input.style.opacity = "0";
+
+      const cleanup = () => {
+        input.onchange = null;
+        input.oncancel = null;
+        input.remove();
+      };
+
+      input.onchange = () => {
+        const files = Array.from(input.files ?? []);
+        cleanup();
+        if (files.length > 0) {
+          onFilesSelected(files);
+        } else {
+          setAttachmentModalVisible(false);
+        }
+      };
+
+      input.oncancel = () => {
+        cleanup();
+        setAttachmentModalVisible(false);
+      };
+
+      document.body.appendChild(input);
+
+      // IMPORTANT: this must run synchronously from the actual button click.
+      try {
+        input.click();
+      } catch (error) {
+        cleanup();
+        setAttachmentModalVisible(false);
+        console.error("[Desktop] Could not open Windows file picker:", error);
+        showAlert(
+          "File picker error",
+          "Windows file selection could not be opened.",
+        );
+      }
+    },
+    [],
+  );
 
   const pickImage = useCallback(async () => {
     try {
+      if (Platform.OS === "web") {
+        openDesktopFilePicker("image/*", (files) => {
+          const selected = files
+            .filter((file) => file.type.startsWith("image/"))
+            .map((file) => ({
+              uri: URL.createObjectURL(file),
+              file,
+            }));
+
+          if (selected.length === 0) {
+            showAlert("No images selected", "Please choose an image file.");
+            return;
+          }
+
+          setWebImageFiles((previous) => [...previous, ...selected]);
+          setImageUris((previous) => [
+            ...new Set([...previous, ...selected.map((item) => item.uri)]),
+          ]);
+          setAttachmentModalVisible(false);
+        });
+        return;
+      }
+
       const permission =
         await ImagePicker.requestMediaLibraryPermissionsAsync();
 
       if (!permission.granted) {
-        Alert.alert(
+        showAlert(
           "Permission required",
-          "Allow photo-library access to attach images or videos.",
+          "Allow photo-library access to attach images.",
         );
         return;
       }
 
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images", "videos"],
+        mediaTypes: ["images"],
+        allowsMultipleSelection: true,
         allowsEditing: false,
         quality: 0.8,
-        videoMaxDuration: 300,
+        selectionLimit: 10,
       });
 
-      if (result.canceled || !result.assets?.length) {
+      if (result.canceled || !result.assets?.length) return;
+
+      const selectedUris = result.assets
+        .filter((asset) => asset.type === "image")
+        .map((asset) => asset.uri);
+
+      if (selectedUris.length) {
+        setImageUris((previous) => [
+          ...new Set([...previous, ...selectedUris]),
+        ]);
+      }
+    } catch (error) {
+      console.error("Image selection error:", error);
+      showAlert("Image error", getErrorMessage(error));
+    }
+  }, [openDesktopFilePicker]);
+
+  const pickVideo = useCallback(async () => {
+    try {
+      if (Platform.OS === "web") {
+        openDesktopFilePicker("video/*", (files) => {
+          const selected = files
+            .filter((file) => file.type.startsWith("video/"))
+            .map((file) => ({
+              uri: URL.createObjectURL(file),
+              file,
+            }));
+
+          if (selected.length === 0) {
+            showAlert("No videos selected", "Please choose a video file.");
+            return;
+          }
+
+          setWebVideoFiles((previous) => [...previous, ...selected]);
+          setVideoUris((previous) => [
+            ...new Set([...previous, ...selected.map((item) => item.uri)]),
+          ]);
+          setAttachmentModalVisible(false);
+        });
         return;
       }
 
-      const asset = result.assets[0];
+      const permission =
+        await ImagePicker.requestMediaLibraryPermissionsAsync();
 
-      if (asset.type === "video") {
-        setVideoUri(asset.uri);
-      } else if (asset.type === "image") {
-        setImageUri(asset.uri);
+      if (!permission.granted) {
+        showAlert(
+          "Permission required",
+          "Please allow media-library access to select videos.",
+        );
+        return;
       }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["videos"],
+        allowsMultipleSelection: true,
+        allowsEditing: false,
+        videoMaxDuration: 300,
+        selectionLimit: 10,
+      });
+
+      if (result.canceled || !result.assets?.length) return;
+
+      const selectedUris = result.assets
+        .filter((asset) => asset.type === "video")
+        .map((asset) => asset.uri);
+
+      setVideoUris((previous) => [...new Set([...previous, ...selectedUris])]);
     } catch (error) {
-      Alert.alert("Media error", getErrorMessage(error));
+      console.error("Video selection error:", error);
+      showAlert("Video error", getErrorMessage(error));
+    }
+  }, [openDesktopFilePicker]);
+
+  const captureImage = useCallback(async () => {
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+
+      if (!permission.granted) {
+        showAlert(
+          "Permission required",
+          "Please allow camera access to take a photo.",
+        );
+        return;
+      }
+
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ["images"],
+        allowsEditing: false,
+        quality: 0.8,
+      });
+
+      if (result.canceled || !result.assets?.length) return;
+
+      const uri = result.assets[0].uri;
+      setImageUris((previous) => [...new Set([...previous, uri])]);
+    } catch (error) {
+      showAlert("Camera error", getErrorMessage(error));
+    }
+  }, []);
+
+  const captureVideo = useCallback(async () => {
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+
+      if (!permission.granted) {
+        showAlert(
+          "Permission required",
+          "Please allow camera access to record a video.",
+        );
+        return;
+      }
+
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ["videos"],
+        videoMaxDuration: 300,
+        cameraType: ImagePicker.CameraType.back,
+      });
+
+      if (result.canceled || !result.assets?.length) return;
+
+      const uri = result.assets[0].uri;
+      setVideoUris((previous) => [...new Set([...previous, uri])]);
+    } catch (error) {
+      showAlert("Video error", getErrorMessage(error));
+    }
+  }, []);
+
+  const pickDocument = useCallback(async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "*/*",
+        copyToCacheDirectory: true,
+        multiple: true,
+      });
+
+      if (result.canceled || !result.assets?.length) return;
+
+      setAttachedFiles((previous) => {
+        const merged = [...previous, ...result.assets];
+        const unique = new Map<string, DocumentPicker.DocumentPickerAsset>();
+        merged.forEach((file) => unique.set(file.uri, file));
+        return [...unique.values()];
+      });
+    } catch (error) {
+      showAlert("File error", getErrorMessage(error));
     }
   }, []);
 
@@ -1673,7 +3505,7 @@ export default function TodolistScreen() {
     try {
       const permission = await AudioModule.requestRecordingPermissionsAsync();
       if (!permission.granted) {
-        Alert.alert(
+        showAlert(
           "Microphone permission",
           "Allow microphone access to record a voice note.",
         );
@@ -1694,7 +3526,7 @@ export default function TodolistScreen() {
       recordingRef.current = false;
       setRecordingSessionActive(false);
       setIsPaused(false);
-      Alert.alert("Recording error", getErrorMessage(error));
+      showAlert("Recording error", getErrorMessage(error));
     } finally {
       if (mounted.current) setRecordingBusy(false);
     }
@@ -1706,7 +3538,7 @@ export default function TodolistScreen() {
       await recorder.pause();
       setIsPaused(true);
     } catch (error) {
-      Alert.alert("Pause error", getErrorMessage(error));
+      showAlert("Pause error", getErrorMessage(error));
     }
   }, [recorder, recordingSessionActive, isPaused, recordingBusy]);
 
@@ -1716,7 +3548,7 @@ export default function TodolistScreen() {
       recorder.record();
       setIsPaused(false);
     } catch (error) {
-      Alert.alert("Resume error", getErrorMessage(error));
+      showAlert("Resume error", getErrorMessage(error));
     }
   }, [recorder, recordingSessionActive, isPaused, recordingBusy]);
 
@@ -1735,13 +3567,13 @@ export default function TodolistScreen() {
         setVoiceUri(uri);
         setPlayerError("");
       } else {
-        Alert.alert(
+        showAlert(
           "Recording unavailable",
           "The recording did not produce a file. Please try again.",
         );
       }
     } catch (error) {
-      Alert.alert("Unable to stop recording", getErrorMessage(error));
+      showAlert("Unable to stop recording", getErrorMessage(error));
     } finally {
       recordingRef.current = false;
       setRecordingSessionActive(false);
@@ -1780,7 +3612,7 @@ export default function TodolistScreen() {
     } catch (error) {
       const message = getErrorMessage(error);
       setPlayerError(message);
-      Alert.alert("Playback error", message);
+      showAlert("Playback error", message);
     }
   }, [player, playerStatus.playing, voiceUri]);
 
@@ -1836,264 +3668,19 @@ export default function TodolistScreen() {
     }
   }, []);
 
-  const recognizeHandwriting = useCallback(
-    async (
-      strokesToRecognize?: DrawingStroke[],
-      languageOverride?: "en-US" | "ta",
-      translateToEnglish = false,
-    ) => {
-      const selectedLanguage = languageOverride ?? drawingLanguage;
-
-      const shouldTranslateToEnglish =
-        translateToEnglish && selectedLanguage === "ta";
-
-      const recognitionLanguage: "en-US" | "ta" = shouldTranslateToEnglish
-        ? "ta"
-        : selectedLanguage;
-
-      const sourceStrokes = strokesToRecognize ?? [
-        ...drawingStrokes,
-        ...(currentDrawingStroke ? [currentDrawingStroke] : []),
-      ];
-
-      const inkStrokes = sourceStrokes
-        .filter(
-          (stroke) =>
-            stroke.color.toLowerCase() !== "#ffffff" &&
-            stroke.points.length > 0,
-        )
-        .map((stroke) => ({
-          points: stroke.points.map((point, index) => ({
-            x: point.x,
-            y: point.y,
-            t: point.t ?? index * 16,
-          })),
-        }));
-
-      if (inkStrokes.length === 0) {
-        setDrawingRecognitionStatus("Write a word on the canvas first.");
-        return;
-      }
-
-      const requestId = ++drawingRecognitionRequestRef.current;
-
-      setDrawingRecognitionBusy(true);
-      setDrawingRecognitionStatus("Recognizing handwriting…");
-
-      try {
-        if (!NitroDigitalInk.isAvailable()) {
-          throw new Error(
-            "Digital Ink Recognition is unavailable in this build.",
-          );
-        }
-
-        console.log("Selected language:", recognitionLanguage);
-        console.log("Translation enabled:", shouldTranslateToEnglish);
-
-        // ML Kit downloads each language's digital-ink model separately.
-        // Ensure the selected model exists before calling recognize().
-        setDrawingRecognitionStatus(
-          recognitionLanguage === "ta"
-            ? "Checking Tamil handwriting model…"
-            : "Checking English handwriting model…",
-        );
-
-        let modelDownloaded =
-          await NitroDigitalInk.isModelDownloaded(recognitionLanguage);
-
-        if (!modelDownloaded) {
-          setDrawingRecognitionStatus(
-            recognitionLanguage === "ta"
-              ? "Downloading Tamil handwriting model. Keep the device online…"
-              : "Downloading English handwriting model. Keep the device online…",
-          );
-
-          await NitroDigitalInk.downloadModel(recognitionLanguage);
-
-          // Confirm the download actually completed before using the model.
-          modelDownloaded =
-            await NitroDigitalInk.isModelDownloaded(recognitionLanguage);
-        }
-
-        if (!modelDownloaded) {
-          throw new Error(
-            `The ${recognitionLanguage === "ta" ? "Tamil" : "English"} handwriting model is not available yet. Connect to the internet and try again.`,
-          );
-        }
-
-        setDrawingRecognitionStatus("Recognizing handwriting…");
-        const candidates = await NitroDigitalInk.recognize(
-          inkStrokes,
-          recognitionLanguage,
-        );
-
-        console.log("Recognition candidates:", candidates);
-
-        if (requestId !== drawingRecognitionRequestRef.current) return;
-
-        const candidateTexts = (candidates ?? [])
-          .map((candidate) => candidate.text?.trim())
-          .filter((text): text is string => Boolean(text));
-
-        console.log("Recognition candidates:", candidateTexts);
-
-        // Prefer a compact candidate for short handwritten words.
-        // Fall back to the first candidate if none matches.
-        const recognizedText =
-          candidateTexts.find((text) => /^[a-zA-Z]+$/.test(text)) ??
-          candidateTexts[0] ??
-          "";
-
-        if (!recognizedText) {
-          setDrawingRecognitionStatus(
-            "No text recognized. Try writing more clearly.",
-          );
-          return;
-        }
-
-        let finalText = recognizedText;
-
-        if (shouldTranslateToEnglish) {
-          setDrawingText(recognizedText);
-          setDrawingRecognitionStatus(
-            "Tamil recognized. Translating to English…",
-          );
-
-          const response = await axios.post<{
-            translatedText?: string;
-            translation?: string;
-          }>(
-            `${API_BASE_URL}/api/translate`,
-            {
-              text: recognizedText,
-              sourceLanguage: "ta",
-              targetLanguage: "en",
-            },
-            { timeout: 20000 },
-          );
-
-          if (requestId !== drawingRecognitionRequestRef.current) return;
-
-          finalText = (
-            response.data?.translatedText ??
-            response.data?.translation ??
-            ""
-          ).trim();
-
-          if (!finalText) {
-            throw new Error("Translation service returned no English text.");
-          }
-        }
-
-        setDrawingText(finalText);
-
-        setContent((previousContent) =>
-          previousContent.trim()
-            ? `${previousContent}\n${finalText}`
-            : finalText,
-        );
-
-        setModifiedAt(new Date().toISOString());
-
-        setDrawingRecognitionStatus(
-          shouldTranslateToEnglish
-            ? `Tamil: ${recognizedText} → English: ${finalText}`
-            : "Handwriting converted to editable text.",
-        );
-      } catch (error) {
-        if (requestId !== drawingRecognitionRequestRef.current) return;
-
-        const rawMessage =
-          error instanceof Error
-            ? error.message
-            : String(error ?? "Could not recognize this handwriting.");
-        const normalizedMessage = rawMessage.toLowerCase();
-        const isMissingModelFiles =
-          normalizedMessage.includes("model files") ||
-          normalizedMessage.includes("enoent") ||
-          normalizedMessage.includes("not found") ||
-          normalizedMessage.includes("filenotfoundexception");
-
-        if (isMissingModelFiles) {
-          // ML Kit may report a model as downloaded even when its files are
-          // incomplete. Remove the cached model and download it again.
-          setDrawingRecognitionStatus(
-            "The handwriting model is incomplete. Repairing the language model…",
-          );
-
-          try {
-            await NitroDigitalInk.deleteModel(recognitionLanguage);
-            await NitroDigitalInk.downloadModel(recognitionLanguage);
-
-            if (requestId === drawingRecognitionRequestRef.current) {
-              setDrawingRecognitionStatus(
-                "Model repaired. Tap Convert to text to try recognition again.",
-              );
-            }
-          } catch (modelRepairError) {
-            const repairMessage =
-              modelRepairError instanceof Error
-                ? modelRepairError.message
-                : String(modelRepairError ?? "Model download failed.");
-
-            if (requestId === drawingRecognitionRequestRef.current) {
-              setDrawingRecognitionStatus(
-                `Could not repair the handwriting model. Check your internet connection and Android storage, then retry. ${repairMessage}`,
-              );
-            }
-
-            console.warn("Digital ink model repair failed:", modelRepairError);
-          }
-        } else {
-          setDrawingRecognitionStatus(rawMessage);
-        }
-
-        console.warn("Handwriting recognition failed:", error);
-      } finally {
-        if (requestId === drawingRecognitionRequestRef.current) {
-          setDrawingRecognitionBusy(false);
-        }
-      }
-    },
-    [
-      drawingStrokes,
-      currentDrawingStroke,
-      drawingLanguage,
-      setContent,
-      setModifiedAt,
-    ],
-  );
-
   useEffect(() => {
     if (drawingRecognitionTimerRef.current) {
       clearTimeout(drawingRecognitionTimerRef.current);
+      drawingRecognitionTimerRef.current = null;
     }
-
-    if (
-      !drawingModalVisible ||
-      drawingStrokes.length === 0 ||
-      currentDrawingStroke ||
-      drawingEraser
-    ) {
-      return;
-    }
-
-    drawingRecognitionTimerRef.current = setTimeout(() => {
-      void recognizeHandwriting(drawingStrokes);
-    }, 1200);
 
     return () => {
       if (drawingRecognitionTimerRef.current) {
         clearTimeout(drawingRecognitionTimerRef.current);
+        drawingRecognitionTimerRef.current = null;
       }
     };
-  }, [
-    drawingModalVisible,
-    drawingStrokes,
-    currentDrawingStroke,
-    drawingEraser,
-    recognizeHandwriting,
-  ]);
+  }, [drawingModalVisible]);
 
   const undoDrawing = useCallback(() => {
     const previous = drawingUndoStack.current.pop();
@@ -2123,15 +3710,23 @@ export default function TodolistScreen() {
   }, [currentDrawingStroke, drawingStrokes]);
 
   const saveDrawing = useCallback(async () => {
+    if (Platform.OS === "web") {
+      showAlert(
+        "Drawing attachment unavailable",
+        "Saving a drawing as an image is supported in the Android app. Use an image upload in the desktop app.",
+      );
+      return;
+    }
+
     if (!drawingCanvasCaptureRef.current) {
-      Alert.alert(
+      showAlert(
         "Drawing unavailable",
         "Please reopen the drawing canvas and try again.",
       );
       return;
     }
     if (drawingStrokes.length === 0 && !currentDrawingStroke) {
-      Alert.alert("Empty canvas", "Draw something before saving.");
+      showAlert("Empty canvas", "Draw something before saving.");
       return;
     }
     try {
@@ -2154,12 +3749,9 @@ export default function TodolistScreen() {
       setDrawingUri(destinationUri);
       setModifiedAt(new Date().toISOString());
       setDrawingModalVisible(false);
-      Alert.alert(
-        "Drawing saved",
-        "Your sketch has been attached to this note.",
-      );
+      showAlert("Drawing saved", "Your sketch has been attached to this note.");
     } catch (error) {
-      Alert.alert(
+      showAlert(
         "Unable to save drawing",
         error instanceof Error
           ? error.message
@@ -2184,7 +3776,8 @@ export default function TodolistScreen() {
 
   const cancelTodoNotifications = useCallback(
     async (targetTodoId?: string | null) => {
-      if (!targetTodoId) return 0;
+      // Local notifications are native-only; do not call them from Electron.
+      if (Platform.OS === "web" || !targetTodoId) return 0;
       const stableId = String(targetTodoId);
       const pending = await Notifications.getAllScheduledNotificationsAsync();
       const matching = pending.filter(
@@ -2208,6 +3801,14 @@ export default function TodolistScreen() {
 
   const scheduleLocalNotification = useCallback(
     async (savedTitle: string, savedTodoId?: string | null) => {
+      // The Todo API save still works on desktop; only native notifications are skipped.
+      if (Platform.OS === "web") {
+        console.info(
+          "[Todo reminders] Skipped: native notifications are mobile-only.",
+        );
+        return;
+      }
+
       const stableTodoId = savedTodoId
         ? String(savedTodoId)
         : todoId
@@ -2357,7 +3958,7 @@ export default function TodolistScreen() {
           stableTodoId === "undefined" ||
           stableTodoId === "null"
         ) {
-          Alert.alert(
+          showAlert(
             "Todo not saved",
             "Save this Todo first, then you can snooze its reminder.",
           );
@@ -2369,7 +3970,7 @@ export default function TodolistScreen() {
           permissions = await Notifications.requestPermissionsAsync();
         }
         if (!permissions.granted) {
-          Alert.alert(
+          showAlert(
             "Notifications disabled",
             "Enable notifications in your phone settings to snooze this reminder.",
           );
@@ -2414,21 +4015,27 @@ export default function TodolistScreen() {
           notificationId,
         );
 
-        Alert.alert(
+        showAlert(
           "Reminder snoozed",
           `Your reminder will appear again in ${minutes} minutes.`,
         );
       } catch (error) {
         console.error("Snooze reminder error:", error);
 
-        Alert.alert("Unable to snooze", "Please try again.");
+        showAlert("Unable to snooze", "Please try again.");
       }
     },
     [],
   );
+
   const buildFormData = useCallback(
-    (updatedAtIso = new Date().toISOString()) => {
+    async (updatedAtIso = new Date().toISOString()): Promise<FormData> => {
       const formData = new FormData();
+
+      // Associate this Todo with the folder that opened the editor, when provided.
+      if (folderId) {
+        formData.append("folderId", folderId);
+      }
 
       // Save the selected Todo due date AND time as a full ISO timestamp.
       // Keep reminder date/time in separate fields.
@@ -2447,47 +4054,189 @@ export default function TodolistScreen() {
           ? `${String(alarmDate.getHours()).padStart(2, "0")}:${String(alarmDate.getMinutes()).padStart(2, "0")}`
           : "",
       );
-      formData.append("status", status);
+      formData.append("status", "pending");
       formData.append("noteType", "todo");
       formData.append("recurring", alarmDate ? recurring : "none");
       formData.append("isQuickNote", "false");
       formData.append("quickNoteColor", quickNoteColor);
       formData.append("quickNotePinned", String(quickNotePinned));
       formData.append("notePattern", notePattern);
+      formData.append("notebookStyle", defaultNotebookStyle);
+      formData.append("noteTextSize", defaultNoteTextSize);
+      formData.append("noteCornerStyle", defaultNoteCornerStyle);
+      // Persist paragraph alignment with the note so View Note can reproduce it.
+      formData.append("alignment", alignment);
+      // Always send the full existing attachment list, including [] when the
+      // user intentionally removed every saved attachment. Omitting this field
+      // makes the backend unable to distinguish "keep old files" from "clear all".
+      const retainedAttachments = existingAttachments.filter((attachment) =>
+        Boolean(attachment.id && attachment.id.trim()),
+      );
+      const retainedFileIds = retainedAttachments.map(
+        (attachment) => attachment.id,
+      );
+      const retainedFileNames = retainedAttachments.map(
+        (attachment) => attachment.name,
+      );
+      const retainedFileTypes = retainedAttachments.map(
+        (attachment) => attachment.type,
+      );
+
+      formData.append("existingFileIds", JSON.stringify(retainedFileIds));
+      // Include compatible metadata fields so the saved Todo/cache can preserve
+      // names and MIME types when the backend supports them.
+      formData.append("fileIds", JSON.stringify(retainedFileIds));
+      formData.append("fileNames", JSON.stringify(retainedFileNames));
+      formData.append("fileTypes", JSON.stringify(retainedFileTypes));
 
       if (userId) formData.append("userId", userId);
 
-      if (imageUri) {
-        formData.append("file", {
-          uri: imageUri,
-          name: getFileName(imageUri, "todo_image.jpg"),
-          type: "image/jpeg",
-        } as unknown as Blob);
+      // Append every newly selected image, video, document, voice note,
+      // background image and drawing. Web/Electron receives real Blob/File
+      // objects; Android/iOS retains React Native URI descriptors.
+      for (let index = 0; index < imageUris.length; index += 1) {
+        const uri = imageUris[index];
+
+        if (Platform.OS === "web") {
+          const selected = webImageFiles.find((item) => item.uri === uri);
+          if (!selected) {
+            throw new Error(
+              "An image preview is no longer linked to its original file. Please remove it and select the image again.",
+            );
+          }
+          await appendLocalUpload(
+            formData,
+            "file",
+            uri,
+            selected.file.name || `todo_image_${index + 1}.jpg`,
+            selected.file.type || "image/jpeg",
+            selected.file,
+          );
+          continue;
+        }
+
+        const name = getFileName(uri, `todo_image_${index + 1}.jpg`);
+        const extension = name.split(".").pop()?.toLowerCase();
+        const mimeType =
+          extension === "png"
+            ? "image/png"
+            : extension === "webp"
+              ? "image/webp"
+              : extension === "heic" || extension === "heif"
+                ? "image/heic"
+                : extension === "gif"
+                  ? "image/gif"
+                  : "image/jpeg";
+
+        await appendLocalUpload(formData, "file", uri, name, mimeType);
       }
 
-      if (videoUri) {
-        const videoName = getFileName(videoUri, "todo_video.mp4");
+      for (let index = 0; index < videoUris.length; index += 1) {
+        const uri = videoUris[index];
+
+        if (Platform.OS === "web") {
+          const selected = webVideoFiles.find((item) => item.uri === uri);
+          if (!selected) {
+            throw new Error(
+              "A video preview is no longer linked to its original file. Please remove it and select the video again.",
+            );
+          }
+          await appendLocalUpload(
+            formData,
+            "file",
+            uri,
+            selected.file.name || `todo_video_${index + 1}.mp4`,
+            selected.file.type || "video/mp4",
+            selected.file,
+          );
+          continue;
+        }
+
+        const videoName = getFileName(uri, `todo_video_${index + 1}.mp4`);
         const videoExtension = videoName.split(".").pop()?.toLowerCase();
         const videoMimeType =
           videoExtension === "mov"
             ? "video/quicktime"
             : videoExtension === "webm"
               ? "video/webm"
-              : "video/mp4";
+              : videoExtension === "m4v"
+                ? "video/x-m4v"
+                : "video/mp4";
 
-        formData.append("file", {
-          uri: videoUri,
-          name: videoName,
-          type: videoMimeType,
-        } as unknown as Blob);
+        await appendLocalUpload(
+          formData,
+          "file",
+          uri,
+          videoName,
+          videoMimeType,
+        );
+      }
+
+      for (let index = 0; index < attachedFiles.length; index += 1) {
+        const file = attachedFiles[index];
+        const fileName = file.name || `todo_document_${index + 1}`;
+        const extension = fileName.split(".").pop()?.toLowerCase();
+        const fallbackMimeType =
+          extension === "pdf"
+            ? "application/pdf"
+            : extension === "doc"
+              ? "application/msword"
+              : extension === "docx"
+                ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                : extension === "txt"
+                  ? "text/plain"
+                  : extension === "xlsx"
+                    ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    : extension === "xls"
+                      ? "application/vnd.ms-excel"
+                      : extension === "ppt"
+                        ? "application/vnd.ms-powerpoint"
+                        : extension === "pptx"
+                          ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                          : extension === "mp3"
+                            ? "audio/mpeg"
+                            : extension === "wav"
+                              ? "audio/wav"
+                              : extension === "m4a"
+                                ? "audio/mp4"
+                                : extension === "webm"
+                                  ? "audio/webm"
+                                  : "application/octet-stream";
+
+        // Expo DocumentPicker exposes `file` on web in supported versions.
+        // Fall back to reading its URI if that property is unavailable.
+        const browserFile = (file as DocumentPicker.DocumentPickerAsset & {
+          file?: File;
+        }).file;
+
+        await appendLocalUpload(
+          formData,
+          "file",
+          file.uri,
+          fileName,
+          file.mimeType || fallbackMimeType,
+          browserFile,
+        );
       }
 
       if (voiceUri) {
-        formData.append("file", {
-          uri: voiceUri,
-          name: getFileName(voiceUri, "todo_voice.m4a"),
-          type: "audio/mp4",
-        } as unknown as Blob);
+        let voiceName = getFileName(voiceUri, "");
+        if (!voiceName || !voiceName.includes(".")) {
+          voiceName =
+            Platform.OS === "web" ? "todo_voice.webm" : "todo_voice.m4a";
+        }
+        const voiceMimeType = getAudioMimeType(
+          voiceName,
+          Platform.OS === "web" ? "audio/webm" : "audio/mp4",
+        );
+
+        await appendLocalUpload(
+          formData,
+          "file",
+          voiceUri,
+          voiceName,
+          voiceMimeType,
+        );
       }
 
       if (noteBackgroundImageUri) {
@@ -2507,19 +4256,25 @@ export default function TodolistScreen() {
               : backgroundExtension === "heic"
                 ? "image/heic"
                 : "image/jpeg";
-        formData.append("backgroundImage", {
-          uri: noteBackgroundImageUri,
-          name: backgroundName,
-          type: backgroundMimeType,
-        } as unknown as Blob);
+
+        await appendLocalUpload(
+          formData,
+          "backgroundImage",
+          noteBackgroundImageUri,
+          backgroundName,
+          backgroundMimeType,
+        );
       }
 
       if (drawingUri) {
-        formData.append("file", {
-          uri: drawingUri,
-          name: getFileName(drawingUri, "todo_sketch.png"),
-          type: "image/png",
-        } as unknown as Blob);
+        const drawingName = getFileName(drawingUri, "todo_sketch.png");
+        await appendLocalUpload(
+          formData,
+          "file",
+          drawingUri,
+          drawingName,
+          "image/png",
+        );
       }
 
       return formData;
@@ -2527,29 +4282,38 @@ export default function TodolistScreen() {
     [
       alarmDate,
       recurring,
+      folderId,
       content,
       createdAt,
       dateText,
       dueDateTime,
-      imageUri,
+      imageUris,
+      videoUris,
+      webImageFiles,
+      webVideoFiles,
+      attachedFiles,
+      existingAttachments,
       status,
       title,
       userId,
       voiceUri,
-      videoUri,
       drawingUri,
       isQuickNote,
       quickNoteColor,
       quickNotePinned,
       notePattern,
+      defaultNotebookStyle,
+      defaultNoteTextSize,
+      defaultNoteCornerStyle,
       noteBackgroundImageUri,
+      alignment,
     ],
   );
 
   const pinNoteToHomeScreen = useCallback(async () => {
     const noteId = String(todoId ?? "").trim();
     if (!noteId || noteId.startsWith("quick-note-")) {
-      Alert.alert(
+      showAlert(
         "Save note first",
         "Save this note to the server, then open it in Edit mode and choose Pin shortcut to home screen.",
       );
@@ -2570,7 +4334,7 @@ export default function TodolistScreen() {
       Platform.OS !== "android" ||
       typeof nativeShortcut?.pinShortcut !== "function"
     ) {
-      Alert.alert(
+      showAlert(
         "Native shortcut unavailable",
         "Pinned home-screen shortcuts require the Android native module and a rebuilt development/production app. Expo Go is not supported.",
       );
@@ -2584,19 +4348,19 @@ export default function TodolistScreen() {
         content.trim(),
       );
       if (pinned) {
-        Alert.alert(
+        showAlert(
           "Shortcut requested",
           "If your launcher supports pinned shortcuts, confirm the Android prompt to add this note to your home screen.",
         );
       } else {
-        Alert.alert(
+        showAlert(
           "Shortcut not added",
           "Android could not pin this shortcut. Try again from your device launcher.",
         );
       }
     } catch (error) {
       console.warn("[PinnedNoteShortcut] Failed:", error);
-      Alert.alert(
+      showAlert(
         "Unable to pin shortcut",
         error instanceof Error
           ? error.message
@@ -2605,30 +4369,101 @@ export default function TodolistScreen() {
     }
   }, [todoId, title, content]);
 
+  const clearSavedDraft = useCallback(async () => {
+    // Block future auto-saves before deleting the key.
+    skipDraftAutoSaveRef.current = true;
+
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+
+    try {
+      // Wait for a write that started before the save completed, so removeItem
+      // runs after it and the old draft cannot win a race against deletion.
+      if (draftWriteInFlightRef.current) {
+        await draftWriteInFlightRef.current.catch(() => undefined);
+      }
+
+      await AsyncStorage.removeItem(draftKey);
+      console.log("[Todo] Draft cleared successfully:", draftKey);
+    } catch (error) {
+      console.error("[Todo] Failed to clear draft:", error);
+    }
+  }, [draftKey]);
+
+  const saveLocalDuplicate = async (updatedTodo: TodoItem) => {
+    const storageKey = "local_todos";
+    const raw = await AsyncStorage.getItem(storageKey);
+    const localTodos: TodoItem[] = raw ? JSON.parse(raw) : [];
+    const id = String(
+      updatedTodo.tdlId ?? updatedTodo._id ?? updatedTodo.id ?? "",
+    );
+
+    const exists = localTodos.some(
+      (item) => String(item.tdlId ?? item._id ?? item.id ?? "") === id,
+    );
+
+    const updatedLocalTodos = exists
+      ? localTodos.map((item) =>
+          String(item.tdlId ?? item._id ?? item.id ?? "") === id
+            ? { ...item, ...updatedTodo, isLocalDuplicate: true }
+            : item,
+        )
+      : [{ ...updatedTodo, isLocalDuplicate: true }, ...localTodos];
+
+    await AsyncStorage.setItem(storageKey, JSON.stringify(updatedLocalTodos));
+
+    try {
+      const cacheRaw = await AsyncStorage.getItem("view_todolist_cache");
+      if (cacheRaw) {
+        const cachedTodos: TodoItem[] = JSON.parse(cacheRaw);
+        const cacheHasItem = cachedTodos.some(
+          (item) => String(item.tdlId ?? item._id ?? item.id ?? "") === id,
+        );
+        if (cacheHasItem) {
+          await AsyncStorage.setItem(
+            "view_todolist_cache",
+            JSON.stringify(
+              cachedTodos.map((item) =>
+                String(item.tdlId ?? item._id ?? item.id ?? "") === id
+                  ? { ...item, ...updatedTodo, isLocalDuplicate: true }
+                  : item,
+              ),
+            ),
+          );
+        }
+      }
+    } catch (cacheError) {
+      console.warn(
+        "[Todo] Could not update local duplicate cache:",
+        cacheError,
+      );
+    }
+  };
+
   const saveTodo = useCallback(async () => {
     if (savingRef.current) return;
 
-    // 1. Validate inputs
     if (!title.trim()) {
-      showAppAlert("Title required", "Please enter a Todo title.");
+      showAlert("Title required", "Please enter a Todo title.");
       return;
     }
 
-    if (!token || !userId) {
-      showAppAlert("Login required", "Please sign in before saving this Todo.");
+    const isLocalDuplicate = Boolean(passedTodo?.isLocalDuplicate);
+
+    if (!isLocalDuplicate && (!token || !userId)) {
+      showAlert("Login required", "Please sign in before saving this Todo.");
       return;
     }
 
     if (!parseDateText(dateText) || Number.isNaN(dueDateTime.getTime())) {
-      showAppAlert(
-        "Invalid due date",
-        "Please select a valid due date and time.",
-      );
+      showAlert("Invalid due date", "Please select a valid due date and time.");
       return;
     }
 
     if (isRecording || recordingRef.current) {
-      showAppAlert(
+      showAlert(
         "Recording in progress",
         "Stop the voice recording before saving.",
       );
@@ -2636,7 +4471,7 @@ export default function TodolistScreen() {
     }
 
     if (alarmDate && alarmDate.getTime() <= Date.now()) {
-      showAppAlert("Invalid reminder", "Choose a reminder time in the future.");
+      showAlert("Invalid reminder", "Choose a reminder time in the future.");
       return;
     }
 
@@ -2644,12 +4479,114 @@ export default function TodolistScreen() {
     setLoading(true);
 
     try {
-      console.log("[Todo] Starting save...");
-
       const nowIso = new Date().toISOString();
       setModifiedAt(nowIso);
 
-      const formData = buildFormData(nowIso);
+      // Local duplicates are edited and saved only on this device.
+      if (isLocalDuplicate && passedTodo) {
+        const localId = String(
+          passedTodo.tdlId ?? passedTodo._id ?? passedTodo.id ?? todoId ?? "",
+        ).trim();
+
+        if (!localId) {
+          throw new Error(
+            "This local copy has no ID. Please duplicate the note again.",
+          );
+        }
+
+        const updatedLocalTodo: TodoItem = {
+          ...passedTodo,
+          tdlId: localId,
+          id: passedTodo.id ?? localId,
+          title: title.trim(),
+          text: content.trim(),
+          date: dueDateTime.toISOString(),
+          alarm: alarmDate?.toISOString() || "",
+          reminderDate: alarmDate ? alarmDate.toISOString() : null,
+          reminderTime: alarmDate
+            ? `${String(alarmDate.getHours()).padStart(2, "0")}:${String(alarmDate.getMinutes()).padStart(2, "0")}`
+            : "",
+          recurring: alarmDate ? recurring : "none",
+          status: "pending",
+          // Preserve attachment MIME/type metadata; View List uses this to render media.
+          type: passedTodo.type,
+          // Keep the saved attachment IDs and metadata in the local-copy record.
+          // Removed attachments are absent because this list comes from the editor.
+          fileIds: existingAttachments.map((attachment) => attachment.id),
+          fileNames: existingAttachments.map((attachment) => attachment.name),
+          fileTypes: existingAttachments.map((attachment) => attachment.type),
+          attachmentNames: existingAttachments.map(
+            (attachment) => attachment.name,
+          ),
+          attachmentTypes: existingAttachments.map(
+            (attachment) => attachment.type,
+          ),
+          quickNoteColor,
+          quickNotePinned,
+          notePattern,
+          notebookStyle: defaultNotebookStyle,
+          noteTextSize: defaultNoteTextSize,
+          noteCornerStyle: defaultNoteCornerStyle,
+          alignment,
+          backgroundImageUrl:
+            noteBackgroundImageUri || passedTodo.backgroundImageUrl,
+          createdAt: passedTodo.createdAt || createdAt,
+          updatedAt: nowIso,
+          isLocalDuplicate: true,
+          textColor: textColor,
+          imageUris: imageUris.length
+            ? imageUris
+            : (passedTodo as any).imageUris || [],
+          videoUris: videoUris.length
+            ? videoUris
+            : (passedTodo as any).videoUris || [],
+          documentAttachments: attachedFiles.map((file) => ({
+            name: file.name,
+            uri: file.uri,
+            mimeType: file.mimeType,
+            size: file.size,
+          })),
+          voiceUri: voiceUri || (passedTodo as any).voiceUri,
+          drawingUri: drawingUri || (passedTodo as any).drawingUri,
+          drawingText,
+        } as TodoItem;
+
+        await saveLocalDuplicate(updatedLocalTodo);
+        await clearSavedDraft();
+
+        if (!mounted.current) return;
+
+        // Electron / Web: React Native Alert button callbacks are not reliable
+        // for navigation, so navigate directly after the local save succeeds.
+        if (Platform.OS === "web") {
+          router.push({
+            pathname: "/viewlist",
+            params: { from: "/cretenote" },
+          });
+          return;
+        }
+
+        // Android / iOS: keep the native success confirmation.
+        showAlert(
+          "Copy saved",
+          "Your duplicate was saved on this device only.",
+          [
+            {
+              text: "OK",
+              onPress: () =>
+                router.push({
+                  pathname: "/viewlist",
+                  params: { from: "/cretenote" },
+                }),
+            },
+          ],
+        );
+        return;
+      }
+
+      // Build multipart data only for server-backed saves. This is async
+      // because browser/Electron local URIs must be converted to Blob objects.
+      const formData = await buildFormData(nowIso);
 
       const apiTodoId = todoId ? String(todoId) : undefined;
 
@@ -2661,7 +4598,6 @@ export default function TodolistScreen() {
         ? `${API_BASE_URL}/api/updateTodolist/${apiTodoId}`
         : `${API_BASE_URL}/api/createTodolist`;
 
-      // 2. Save to the backend
       const response = shouldUpdate
         ? await axios.put<ApiResponse>(url, formData, {
             headers: { ...authHeader(token) },
@@ -2672,8 +4608,6 @@ export default function TodolistScreen() {
             timeout: 20000,
           });
 
-      console.log("[Todo] API response:", response.data);
-
       if (response.data?.success !== true) {
         throw new Error(
           response.data?.message ||
@@ -2681,7 +4615,10 @@ export default function TodolistScreen() {
         );
       }
 
-      // 3. Extract the saved Todo
+      // Database save confirmed: clear the draft immediately.
+      await clearSavedDraft();
+
+      // Get the saved Todo returned by the backend.
       const responsePayload =
         response.data.todo ??
         response.data.task ??
@@ -2698,27 +4635,39 @@ export default function TodolistScreen() {
           "",
       ).trim();
 
-      // 4. Update the Android home-screen widget.
-      // Widget failure must not prevent the save-success alert.
-      if (Platform.OS !== "web") {
+      // =====================================================
+      // SAVE FOLDER ASSIGNMENT LOCALLY
+      // Uses the existing organization metadata storage key.
+      // Does not send folderId to the backend.
+      // =====================================================
+      if (folderId && savedTodoId) {
         try {
-          const widgetUpdated = await updateHomeNoteWidget(
-            title.trim() || "My Notes",
-            content.trim() || "No content yet.",
-          );
+          const storageKey = "notes:organization-meta";
 
-          if (!widgetUpdated) {
-            console.warn("[HomeNoteWidget] Update returned false.");
-          }
-        } catch (widgetError) {
-          console.warn(
-            "[HomeNoteWidget] Failed to update widget:",
-            widgetError,
+          const raw = await AsyncStorage.getItem(storageKey);
+
+          const parsed: Record<string, any> = raw ? JSON.parse(raw) : {};
+
+          // Preserve existing metadata for this Todo.
+          parsed[savedTodoId] = {
+            ...(parsed[savedTodoId] ?? {}),
+            folderId,
+          };
+
+          await AsyncStorage.setItem(storageKey, JSON.stringify(parsed));
+
+          console.log("[Folder] Todo assigned locally:", savedTodoId, folderId);
+        } catch (folderError) {
+          console.error(
+            "[Folder] Failed to save folder assignment:",
+            folderError,
           );
         }
       }
 
-      // 5. Save note appearance metadata
+      // =====================================================
+      // PERSIST NOTE APPEARANCE METADATA
+      // =====================================================
       const persistedBackground =
         responsePayload?.backgroundImageUrl ||
         responsePayload?.backgroundImage ||
@@ -2729,6 +4678,11 @@ export default function TodolistScreen() {
         isQuickNote: false,
         quickNoteColor,
         notePattern,
+        notebookStyle: defaultNotebookStyle,
+        noteTextSize: defaultNoteTextSize,
+        noteCornerStyle: defaultNoteCornerStyle,
+        alignment,
+        textColor: textColor,
         backgroundImageUri: persistedBackground,
         noteBackgroundImage: undefined,
         updatedAt: new Date().toISOString(),
@@ -2750,39 +4704,29 @@ export default function TodolistScreen() {
         ),
       );
 
-      await AsyncStorage.removeItem(draftKey);
-
-      // 6. Schedule the reminder where supported.
+      // =====================================================
+      // SCHEDULE REMINDER
+      // =====================================================
       let reminderMessage = "";
 
-      if (alarmDate) {
-        if (Platform.OS === "web") {
-          reminderMessage =
-            "\nThe Todo was saved, but desktop reminder scheduling is not configured.";
-        } else {
-          try {
-            await scheduleLocalNotification(title.trim(), savedTodoId || null);
+      try {
+        await scheduleLocalNotification(title.trim(), savedTodoId || null);
 
-            reminderMessage = "\nReminder scheduled successfully.";
-          } catch (notificationError) {
-            console.warn(
-              "[Todo] Reminder scheduling failed:",
-              notificationError,
-            );
+        reminderMessage = alarmDate
+          ? "\nReminder scheduled successfully."
+          : "\nNo reminder is set.";
+      } catch (notificationError) {
+        console.warn(
+          "Todo reminder could not be scheduled:",
+          notificationError,
+        );
 
-            reminderMessage =
-              "\nTodo saved, but the reminder was not scheduled: " +
-              getErrorMessage(notificationError);
-          }
-        }
-      } else {
-        reminderMessage = "\nNo reminder is set.";
+        reminderMessage =
+          "\nTodo saved, but the reminder was not scheduled: " +
+          getErrorMessage(notificationError);
       }
 
-      // 7. Show success only while this screen is mounted.
       if (!mounted.current) return;
-
-      console.log("[Todo] Save successful; showing alert.");
 
       const successMessage =
         (isEditing
@@ -2790,14 +4734,27 @@ export default function TodolistScreen() {
           : "Your Todo and its selected theme/template settings were saved to the database.") +
         reminderMessage;
 
-      showAppAlert("Todo saved", successMessage, () =>
-        router.push("/viewlist"),
-      );
+      // Electron / Web: navigate immediately after the server confirms success.
+      if (Platform.OS === "web") {
+        router.push({
+          pathname: "/viewlist",
+          params: { from: "/cretenote" },
+        });
+        return;
+      }
+
+      // Android / iOS: preserve the native success alert.
+      showAlert("Todo saved", successMessage, [
+        {
+          text: "OK",
+          onPress: () => router.replace("/viewlist"),
+        },
+      ]);
     } catch (error) {
       console.error("[Todo] Save failed:", error);
 
       if (mounted.current) {
-        showAppAlert("Save failed", getErrorMessage(error));
+        showAlert("Save failed", getErrorMessage(error));
       }
     } finally {
       savingRef.current = false;
@@ -2808,7 +4765,9 @@ export default function TodolistScreen() {
     }
   }, [
     alarmDate,
+    recurring,
     buildFormData,
+    clearSavedDraft,
     dateText,
     dueDateTime,
     draftKey,
@@ -2822,8 +4781,13 @@ export default function TodolistScreen() {
     userId,
     quickNoteColor,
     notePattern,
+    defaultNotebookStyle,
+    defaultNoteTextSize,
+    defaultNoteCornerStyle,
     noteBackgroundImageUri,
-    router,
+    folderId,
+    textColor,
+    alignment,
   ]);
 
   const clearReminder = useCallback(async () => {
@@ -2832,19 +4796,23 @@ export default function TodolistScreen() {
       if (stableTodoId) await cancelTodoNotifications(stableTodoId);
       setAlarmDate(null);
       setRecurring("none");
-      Alert.alert(
+      showAlert(
         "Reminder cleared",
         "The reminder has been removed from this Todo.",
       );
     } catch (error) {
       console.error("Unable to clear Todo reminder:", error);
-      Alert.alert("Could not clear reminder", getErrorMessage(error));
+      showAlert("Could not clear reminder", getErrorMessage(error));
     }
   }, [todoId, cancelTodoNotifications]);
 
   const clearImage = useCallback(() => {
-    setImageUri(null);
-  }, []);
+    if (Platform.OS === "web") {
+      webImageFiles.forEach(({ uri }) => URL.revokeObjectURL(uri));
+    }
+    setImageUris([]);
+    setWebImageFiles([]);
+  }, [webImageFiles]);
 
   const clearVoice = useCallback(async () => {
     try {
@@ -2856,7 +4824,10 @@ export default function TodolistScreen() {
 
   const cancel = useCallback(() => {
     if (loading) return;
-    router.replace("/viewlist");
+    router.push({
+      pathname: "/viewlist",
+      params: { from: "/cretenote" },
+    });
   }, [loading]);
 
   const formatButton = (
@@ -2904,1550 +4875,2038 @@ export default function TodolistScreen() {
     <SafeAreaView style={themeStyle(styles.safeArea)}>
       <KeyboardAvoidingView
         style={themeStyle(uiStyles.flex)}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
       >
         <ScrollView
           style={themeStyle(uiStyles.screen)}
-          contentContainerStyle={themeStyle(uiStyles.scrollContent)}
+          contentContainerStyle={[
+            themeStyle(uiStyles.scrollContent),
+            {
+              width: "100%",
+              maxWidth: isDesktop ? (isWideDesktop ? 1480 : 1280) : 820,
+              alignSelf: "center",
+              paddingHorizontal: isDesktop
+                ? isWideDesktop
+                  ? 44
+                  : 32
+                : pageHorizontalPadding,
+              paddingTop: isDesktop ? 28 : isShortScreen ? 8 : 14,
+              paddingBottom: isDesktop ? 56 : isShortScreen ? 28 : 42,
+            },
+          ]}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          <LinearGradient
-            colors={
-              isDark
-                ? [appTheme.surface, appTheme.background, appTheme.surface]
-                : ["#C6F3E0", "#E4FBEE", "#A8EEDB"]
-            }
-            start={{ x: 0, y: 0 }}
-            end={{ x: 1, y: 1 }}
-            style={themeStyle(uiStyles.header)}
+          <View
+            style={[
+              themeStyle(uiStyles.header),
+              {
+                backgroundColor: mintTheme.background,
+
+                // Complete border on all four sides
+                borderWidth: 1,
+                borderColor: mintTheme.border,
+
+                paddingHorizontal: isDesktop ? 24 : isNarrowPhone ? 10 : 14,
+                paddingVertical: isDesktop ? 18 : isShortScreen ? 7 : 10,
+
+                borderRadius: isDesktop ? 22 : 0,
+                marginBottom: isDesktop ? 22 : 0,
+
+                shadowColor: isDesktop ? "#173F38" : "transparent",
+                shadowOffset: { width: 0, height: 5 },
+                shadowOpacity: isDesktop ? 0.05 : 0,
+                shadowRadius: 14,
+                elevation: isDesktop ? 2 : 0,
+              },
+            ]}
           >
-            <View style={themeStyle(uiStyles.headerRow)}>
+            <View
+              style={[
+                themeStyle(uiStyles.headerRow),
+                {
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: isNarrowPhone ? 6 : 10,
+                },
+              ]}
+            >
+              {/* Back button */}
               <Pressable
                 onPress={cancel}
-                style={themeStyle(uiStyles.backButton)}
+                style={[
+                  themeStyle(uiStyles.backButton),
+                  {
+                    width: isNarrowPhone ? 38 : 44,
+                    height: isNarrowPhone ? 40 : 44,
+                    alignItems: "center",
+                    justifyContent: "center",
+                    backgroundColor: mintTheme.surface,
+                    borderRadius: 14,
+                    borderWidth: 1,
+                    borderColor: mintTheme.border,
+                  },
+                ]}
+                accessibilityRole="button"
                 accessibilityLabel="Go back"
+                hitSlop={8}
               >
-                <Ionicons name="arrow-back" size={25} color={appTheme.text} />
+                <Ionicons name="arrow-back" size={21} color={mintTheme.text} />
               </Pressable>
-              <View style={themeStyle(uiStyles.headerCopy)}>
-                <Text style={themeStyle(uiStyles.headerTitle)}>
+
+              {/* Title and subtitle */}
+              <View
+                style={[
+                  themeStyle(uiStyles.headerCopy),
+                  {
+                    flex: 1,
+                    minWidth: 0,
+                  },
+                ]}
+              >
+                <Text
+                  style={[
+                    themeStyle(uiStyles.headerTitle),
+                    {
+                      color: mintTheme.text,
+                      fontSize: isNarrowPhone ? 16 : 18,
+                      fontWeight: "700",
+                    },
+                  ]}
+                  numberOfLines={1}
+                >
                   {isEditing ? "Edit Note" : "Create Note"}
                 </Text>
-                <Text style={themeStyle(uiStyles.headerSubtitle)}>
+
+                <Text
+                  style={[
+                    themeStyle(uiStyles.headerSubtitle),
+                    {
+                      color: mintTheme.subtitle,
+                      fontSize: 12,
+                      marginTop: 3,
+                    },
+                  ]}
+                  numberOfLines={1}
+                >
                   Capture your thoughts
                 </Text>
               </View>
+
+              {/* View List button */}
               <Pressable
-                style={themeStyle(uiStyles.quickSave)}
-                onPress={() => void saveTodo()}
-                disabled={loading}
+                onPress={() =>
+                  router.push({
+                    pathname: "/viewlist",
+                    params: { from: "/cretenote" },
+                  })
+                }
+                style={{
+                  width: isNarrowPhone ? 36 : 42,
+                  height: isNarrowPhone ? 40 : 44,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: mintTheme.surface,
+                  borderRadius: 14,
+                  borderWidth: 1,
+                  borderColor: mintTheme.border,
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="View Todo List"
+                hitSlop={8}
               >
                 <Ionicons
-                  name="cloud-upload-outline"
-                  size={20}
-                  color="#FFFFFF"
+                  name="list-outline"
+                  size={21}
+                  color={mintTheme.primary}
                 />
-                <Text style={themeStyle(uiStyles.quickSaveText)}>
-                  {loading ? "Saving…" : "Quick Save"}
-                </Text>
               </Pressable>
 
+              {/* Delete Local Draft button */}
               <Pressable
-                style={themeStyle(uiStyles.moreButton)}
                 onPress={() =>
-                  Alert.alert(
-                    "Note options",
-                    "Choose an action",
+                  showAlert(
+                    "Delete local draft?",
+                    "This removes the autosaved draft on this device. A Todo already saved to the server will remain unchanged.",
                     [
                       {
-                        text: "Edit Note",
-                        onPress: () => contentInputRef.current?.focus(),
-                      },
-                      {
-                        text: quickNotePinned ? "Unpin note" : "Pin note",
-                        onPress: () => setQuickNotePinned((v) => !v),
-                      },
-                      {
-                        text: "Delete Local Draft",
-                        style: "destructive",
-                        onPress: () => {
-                          Alert.alert(
-                            "Delete local draft?",
-                            "This removes the autosaved draft on this device. A Todo already saved to the server will remain unchanged.",
-                            [
-                              {
-                                text: "Cancel",
-                                style: "cancel",
-                              },
-                              {
-                                text: "Close",
-                                style: "cancel",
-                              },
-                              {
-                                text: "Delete Draft",
-                                style: "destructive",
-                                onPress: () => void deleteLocalDraft(),
-                              },
-                            ],
-                            { cancelable: true },
-                          );
-                        },
-                      },
-                      {
-                        text: "Open Todo List",
-                        onPress: () => router.push("/viewlist"),
-                      },
-                      {
-                        text: "Close",
+                        text: "Cancel",
                         style: "cancel",
+                      },
+                      {
+                        text: "Delete Draft",
+                        style: "destructive",
+                        onPress: () => void deleteLocalDraft(),
                       },
                     ],
                     { cancelable: true },
                   )
                 }
+                style={{
+                  width: isNarrowPhone ? 36 : 42,
+                  height: isNarrowPhone ? 40 : 44,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: "#FFF1F0",
+                  borderRadius: 14,
+                  borderWidth: 1,
+                  borderColor: "#F5D4D1",
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Delete local draft"
+                hitSlop={8}
               >
-                <Ionicons
-                  name="ellipsis-vertical"
-                  size={21}
-                  color={appTheme.text}
-                />
+                <Ionicons name="trash-outline" size={20} color="#C74B45" />
               </Pressable>
             </View>
-            <View style={themeStyle(uiStyles.headerArt)}>
-              <Ionicons name="leaf" size={29} color="#39BDA0" />
-              <Ionicons name="document-text" size={51} color="#159F89" />
-              <Ionicons name="pencil" size={29} color="#087B72" />
-            </View>
-          </LinearGradient>
-
-          <View style={themeStyle(uiStyles.titleField)}>
-            <View style={themeStyle(uiStyles.titleIcon)}>
-              <Ionicons
-                name="pencil-outline"
-                size={25}
-                color={appTheme.secondaryText}
-              />
-            </View>
-            <TextInput
-              value={title}
-              onChangeText={setTitle}
-              placeholder="Note title..."
-              placeholderTextColor={appTheme.secondaryText}
-              maxLength={100}
-              style={themeStyle(uiStyles.titleInput)}
-              returnKeyType="next"
-            />
-            <Text style={themeStyle(uiStyles.counter)}>{title.length}/100</Text>
           </View>
 
-          <View style={themeStyle(styles.editorToolbar)}>
-            {/* Row 1: Text styling */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              keyboardShouldPersistTaps="handled"
-              contentContainerStyle={themeStyle(styles.toolbarRow)}
+          {isDesktop && (
+            <View
+              style={{
+                backgroundColor: mintTheme.surface,
+                borderColor: mintTheme.border,
+                borderWidth: 1,
+                borderRadius: 24,
+                paddingHorizontal: 26,
+                paddingVertical: 22,
+                marginBottom: 20,
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 20,
+                shadowColor: "#173F38",
+                shadowOffset: { width: 0, height: 5 },
+                shadowOpacity: 0.035,
+                shadowRadius: 14,
+                elevation: 1,
+              }}
             >
-              <Text style={themeStyle(styles.toolbarLabel)}>STYLE</Text>
-              {formatButton("B", bold, () => setBold((v) => !v), "Bold")}
-              {formatButton("I", italic, () => setItalic((v) => !v), "Italic")}
-              {formatButton(
-                "U",
-                underline,
-                () => setUnderline((v) => !v),
-                "Underline",
-              )}
-
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Toggle strikethrough"
-                accessibilityState={{ selected: strikethrough }}
-                style={[
-                  themeStyle(styles.toolButton),
-                  strikethrough && themeStyle(styles.toolButtonActive),
-                ]}
-                onPress={() => setStrikethrough((value) => !value)}
-              >
+              <View style={{ flex: 1, minWidth: 0 }}>
                 <Text
-                  style={[
-                    themeStyle(styles.toolText),
-                    { textDecorationLine: "line-through" },
-                  ]}
-                >
-                  S
-                </Text>
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => setColorPaletteVisible(true)}
-                accessibilityRole="button"
-                accessibilityLabel="Open text color palette"
-              >
-                <Ionicons
-                  name="color-palette-outline"
-                  size={19}
-                  color={textColor}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => setFontPickerVisible(true)}
-                accessibilityRole="button"
-                accessibilityLabel="Choose font family"
-              >
-                <Ionicons
-                  name="text-outline"
-                  size={19}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-            </ScrollView>
-
-            <View style={themeStyle(styles.toolbarSeparator)} />
-
-            {/* Row 2: Paragraph and lists */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              keyboardShouldPersistTaps="handled"
-              contentContainerStyle={themeStyle(styles.toolbarRow)}
-            >
-              <Text style={themeStyle(styles.toolbarLabel)}>PARAGRAPH</Text>
-              {(
-                [
-                  ["left", "Align left", "menu-outline"],
-                  ["center", "Align center", "reorder-three-outline"],
-                  ["right", "Align right", "menu-outline"],
-                  ["justify", "Justify text", "list-outline"],
-                ] as const
-              ).map(([value, label, iconName]) => (
-                <Pressable
-                  key={value}
-                  accessibilityRole="button"
-                  accessibilityLabel={label}
-                  accessibilityState={{ selected: alignment === value }}
-                  style={[
-                    themeStyle(styles.toolButton),
-                    alignment === value && themeStyle(styles.toolButtonActive),
-                  ]}
-                  onPress={() => setAlignment(value)}
-                >
-                  <Ionicons
-                    name={iconName}
-                    size={19}
-                    color={
-                      alignment === value
-                        ? personalAccentColor
-                        : appTheme.secondaryText
-                    }
-                    style={
-                      value === "right"
-                        ? { transform: [{ scaleX: -1 }] }
-                        : undefined
-                    }
-                  />
-                </Pressable>
-              ))}
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => replaceSelection("• ")}
-                accessibilityRole="button"
-                accessibilityLabel="Insert bullet list"
-              >
-                <Text style={themeStyle(styles.toolText)}>• List</Text>
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => {
-                  replaceSelection(`${listNumber}. `);
-                  setListNumber((prev) => prev + 1);
-                }}
-                accessibilityRole="button"
-                accessibilityLabel="Insert numbered list"
-              >
-                <Text style={themeStyle(styles.toolText)}>1. List</Text>
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => {
-                  const checklist = Array.from({ length: 5 }, () => "☐ ").join(
-                    "\n",
-                  );
-
-                  replaceSelection(checklist);
-                }}
-                accessibilityRole="button"
-                accessibilityLabel="Insert five checklist items"
-              >
-                <Text style={themeStyle(styles.toolText)}>☐ Checklist</Text>
-              </Pressable>
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => {
-                  const checklist = Array.from({ length: 5 }, () => "☑ ").join(
-                    "\n",
-                  );
-
-                  replaceSelection(checklist);
-                }}
-                accessibilityRole="button"
-                accessibilityLabel="Insert five checked checklist items"
-              >
-                <Text style={themeStyle(styles.toolText)}>☑ Checked</Text>
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={openChecklistReorder}
-                accessibilityRole="button"
-                accessibilityLabel="Reorder checklist items"
-              >
-                <Ionicons
-                  name="reorder-three-outline"
-                  size={19}
-                  color={appTheme.secondaryText}
-                />
-                <Text style={themeStyle(styles.toolText)}>Reorder</Text>
-              </Pressable>
-
-              {reorderChecklistVisible && (
-                <View
                   style={{
-                    marginVertical: 12,
-                    padding: 12,
-                    borderRadius: 12,
-                    borderWidth: 1,
-                    borderColor: appTheme.primary,
-                    backgroundColor: appTheme.surface,
+                    color: mintTheme.primary,
+                    fontSize: 11,
+                    fontWeight: "800",
+                    letterSpacing: 1.5,
+                    marginBottom: 7,
                   }}
                 >
-                  <Text
-                    style={{
-                      color: appTheme.text,
-                      fontSize: 17,
-                      fontWeight: "700",
-                      marginBottom: 10,
-                    }}
-                  >
-                    Reorder Checklist Items
-                  </Text>
+                  PERSONAL WORKSPACE
+                </Text>
+                <Text
+                  style={{
+                    color: mintTheme.text,
+                    fontSize: isWideDesktop ? 28 : 25,
+                    fontWeight: "800",
+                    letterSpacing: -0.6,
+                  }}
+                >
+                  {isEditing
+                    ? "Refine your note."
+                    : "Make space for your ideas."}
+                </Text>
+                <Text
+                  style={{
+                    color: mintTheme.subtitle,
+                    fontSize: 14,
+                    lineHeight: 21,
+                    marginTop: 7,
+                  }}
+                >
+                  Write, organize and enrich your thoughts in one place.
+                </Text>
+              </View>
+              <View
+                style={{
+                  width: 58,
+                  height: 58,
+                  borderRadius: 19,
+                  backgroundColor: "#DDF4E8",
+                  borderWidth: 1,
+                  borderColor: mintTheme.border,
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <Ionicons
+                  name="document-text-outline"
+                  size={27}
+                  color={mintTheme.primary}
+                />
+              </View>
+            </View>
+          )}
 
-                  {reorderChecklistItems.length === 0 ? (
-                    <Text style={{ color: appTheme.secondaryText }}>
-                      No checkbox items found in your note.
-                    </Text>
-                  ) : (
-                    <DraggableFlatList
-                      data={reorderChecklistItems}
-                      keyExtractor={(item) => item.id}
-                      activationDistance={8}
-                      scrollEnabled={false}
-                      onDragEnd={({ data }) => {
-                        saveChecklistReorder(data);
-                      }}
-                      renderItem={({ item, drag, isActive }) => (
-                        <ScaleDecorator>
-                          <View
-                            style={{
-                              flexDirection: "row",
-                              alignItems: "center",
-                              padding: 8,
-                              marginBottom: 6,
-                              borderRadius: 8,
-                              backgroundColor: isActive
-                                ? `${appTheme.primary}20`
-                                : appTheme.surface,
-                            }}
-                          >
-                            <Pressable
-                              onPress={() => {
-                                const updated = reorderChecklistItems.map(
-                                  (entry) =>
-                                    entry.id === item.id
-                                      ? {
-                                          ...entry,
-                                          checked: !entry.checked,
-                                        }
-                                      : entry,
-                                );
+          {/* Responsive workspace: main editor column */}
+          <View
+            style={{
+              width: "100%",
+              flexDirection: isDesktop ? "row" : "column",
+              alignItems: "flex-start",
+              gap: isDesktop ? 24 : 0,
+            }}
+          >
+            <View
+              style={{
+                flex: isDesktop ? 1 : undefined,
+                width: isDesktop ? undefined : "100%",
+                minWidth: 0,
+                ...(isDesktop
+                  ? {
+                      padding: 22,
+                      backgroundColor: mintTheme.surface,
+                      borderWidth: 1,
+                      borderColor: mintTheme.border,
+                      borderRadius: 24,
+                      shadowColor: "#173F38",
+                      shadowOffset: { width: 0, height: 8 },
+                      shadowOpacity: 0.045,
+                      shadowRadius: 20,
+                      elevation: 2,
+                    }
+                  : {}),
+              }}
+            >
+              {/* Note Title Input */}
+              <View
+                style={[
+                  themeStyle(uiStyles.titleField),
+                  {
+                    flexDirection: "row",
+                    alignItems: "center",
+                    backgroundColor: mintTheme.surface,
+                    borderWidth: 1,
+                    borderColor: mintTheme.border,
+                    borderRadius: isDesktop ? 16 : 18,
+                    paddingHorizontal: isNarrowPhone ? 9 : 14,
+                    paddingVertical: isNarrowPhone ? 4 : 6,
+                    minHeight: isNarrowPhone ? 54 : isDesktop ? 66 : 64,
+                    gap: isNarrowPhone ? 7 : 12,
+                    ...(isDesktop
+                      ? {
+                          shadowColor: "#173F38",
+                          shadowOffset: { width: 0, height: 3 },
+                          shadowOpacity: 0.025,
+                          shadowRadius: 8,
+                          elevation: 1,
+                        }
+                      : {}),
+                  },
+                ]}
+              >
+                {/* Pencil icon */}
+                <View
+                  style={{
+                    width: isNarrowPhone ? 34 : 42,
+                    height: isNarrowPhone ? 34 : 42,
+                    alignItems: "center",
+                    justifyContent: "center",
+                    backgroundColor: mintTheme.background,
+                    borderRadius: 13,
+                    borderWidth: 1,
+                    borderColor: mintTheme.border,
+                  }}
+                >
+                  <Ionicons
+                    name="pencil-outline"
+                    size={21}
+                    color={mintTheme.primary}
+                  />
+                </View>
 
-                                saveChecklistReorder(updated);
-                              }}
-                              accessibilityRole="checkbox"
-                              accessibilityState={{ checked: item.checked }}
-                            >
-                              <Ionicons
-                                name={
-                                  item.checked ? "checkbox" : "square-outline"
-                                }
-                                size={23}
-                                color={appTheme.primary}
-                              />
-                            </Pressable>
+                {/* Title input */}
+                <TextInput
+                  value={title}
+                  onChangeText={setTitle}
+                  placeholder="Give your note a title..."
+                  placeholderTextColor={mintTheme.subtitle}
+                  maxLength={100}
+                  style={[
+                    themeStyle(uiStyles.titleInput),
+                    {
+                      flex: 1,
+                      minWidth: 0,
+                      color: mintTheme.text,
+                      fontSize: isNarrowPhone ? 14 : 16,
+                      fontWeight: "600",
+                      paddingVertical: 10,
+                    },
+                  ]}
+                  returnKeyType="next"
+                  accessibilityLabel="Note title"
+                />
 
-                            <Text
-                              style={{
-                                flex: 1,
-                                marginHorizontal: 10,
-                                color: appTheme.text,
-                                textDecorationLine: item.checked
-                                  ? "line-through"
-                                  : "none",
-                              }}
-                            >
-                              {item.text || "Untitled item"}
-                            </Text>
+                {/* Character counter */}
+                <Text
+                  style={[
+                    themeStyle(uiStyles.counter),
+                    {
+                      color: mintTheme.subtitle,
+                      fontSize: 11,
+                      fontWeight: "600",
+                      minWidth: isNarrowPhone ? 30 : 38,
+                      textAlign: "right",
+                    },
+                  ]}
+                >
+                  {title.length}/100
+                </Text>
+              </View>
 
-                            <Pressable
-                              onLongPress={drag}
-                              delayLongPress={150}
-                              disabled={isActive}
-                              accessibilityRole="button"
-                              accessibilityLabel={`Move ${item.text}`}
-                              hitSlop={8}
-                              style={{ padding: 6 }}
-                            >
-                              <Ionicons
-                                name="reorder-three-outline"
-                                size={25}
-                                color={appTheme.secondaryText}
-                              />
-                            </Pressable>
-                          </View>
-                        </ScaleDecorator>
-                      )}
-                    />
+              <View
+                style={[
+                  themeStyle(styles.editorToolbar),
+                  {
+                    paddingHorizontal: isDesktop ? 14 : isNarrowPhone ? 5 : 9,
+                    paddingVertical: isDesktop ? 12 : isNarrowPhone ? 6 : 9,
+                    marginBottom: isDesktop ? 18 : isNarrowPhone ? 10 : 15,
+                    borderRadius: isDesktop ? 16 : undefined,
+                    backgroundColor: isDesktop ? "#FFFFFF" : undefined,
+                    borderColor: isDesktop ? mintTheme.border : undefined,
+                    borderWidth: isDesktop ? 1 : undefined,
+                    width: "100%",
+                    ...(isDesktop
+                      ? {
+                          shadowColor: "#173F38",
+                          shadowOffset: { width: 0, height: 3 },
+                          shadowOpacity: 0.025,
+                          shadowRadius: 8,
+                          elevation: 1,
+                        }
+                      : {}),
+                  },
+                ]}
+              >
+                {/* Row 1: Text styling */}
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  contentContainerStyle={themeStyle(styles.toolbarRow)}
+                >
+                  <Text style={themeStyle(styles.toolbarLabel)}>STYLE</Text>
+                  {formatButton("B", bold, () => setBold((v) => !v), "Bold")}
+                  {formatButton(
+                    "I",
+                    italic,
+                    () => setItalic((v) => !v),
+                    "Italic",
+                  )}
+                  {formatButton(
+                    "U",
+                    underline,
+                    () => setUnderline((v) => !v),
+                    "Underline",
                   )}
 
                   <Pressable
-                    onPress={() => setReorderChecklistVisible(false)}
-                    style={{
-                      alignSelf: "flex-end",
-                      marginTop: 10,
-                      paddingHorizontal: 16,
-                      paddingVertical: 9,
-                      borderRadius: 8,
-                      backgroundColor: appTheme.primary,
-                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Toggle strikethrough"
+                    accessibilityState={{ selected: strikethrough }}
+                    style={[
+                      themeStyle(styles.toolButton),
+                      strikethrough && themeStyle(styles.toolButtonActive),
+                    ]}
+                    onPress={() => setStrikethrough((value) => !value)}
                   >
-                    <Text style={{ color: "#FFFFFF", fontWeight: "600" }}>
-                      Done
-                    </Text>
-                  </Pressable>
-                </View>
-              )}
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => changeIndent("decrease")}
-                accessibilityRole="button"
-                accessibilityLabel="Decrease indent"
-              >
-                <Ionicons
-                  name="return-up-back-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => changeIndent("increase")}
-                accessibilityRole="button"
-                accessibilityLabel="Increase indent"
-              >
-                <Ionicons
-                  name="return-down-forward-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => setSpacingModalVisible(true)}
-                accessibilityRole="button"
-                accessibilityLabel="Adjust text spacing"
-              >
-                <Ionicons
-                  name="menu-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-                <Text style={themeStyle(styles.spacingButtonLabel)}>
-                  Spacing
-                </Text>
-              </Pressable>
-            </ScrollView>
-
-            <View style={themeStyle(styles.toolbarSeparator)} />
-
-            {/* Row 3: Editing tools */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              keyboardShouldPersistTaps="handled"
-              contentContainerStyle={themeStyle(styles.toolbarRow)}
-            >
-              <Text style={themeStyle(styles.toolbarLabel)}>EDIT</Text>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={undoEdit}
-                accessibilityRole="button"
-                accessibilityLabel="Undo"
-              >
-                <Ionicons
-                  name="arrow-undo-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={redoEdit}
-                accessibilityRole="button"
-                accessibilityLabel="Redo"
-              >
-                <Ionicons
-                  name="arrow-redo-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => void copyContent()}
-                accessibilityRole="button"
-                accessibilityLabel="Copy"
-              >
-                <Ionicons
-                  name="copy-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => void pasteContent()}
-                accessibilityRole="button"
-                accessibilityLabel="Paste"
-              >
-                <Ionicons
-                  name="clipboard-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => void cutSelection()}
-                accessibilityRole="button"
-                accessibilityLabel="Cut"
-              >
-                <Ionicons
-                  name="cut-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() =>
-                  setSelection({
-                    start: 0,
-                    end: content.length,
-                  })
-                }
-                accessibilityRole="button"
-                accessibilityLabel="Select all"
-              >
-                <Ionicons
-                  name="scan-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={insertHyperlink}
-                accessibilityRole="button"
-                accessibilityLabel="Insert hyperlink"
-              >
-                <Ionicons
-                  name="link-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <Pressable
-                style={themeStyle(styles.toolButton)}
-                onPress={() => void openFirstHyperlink()}
-                accessibilityRole="button"
-                accessibilityLabel="Open URL"
-              >
-                <Ionicons
-                  name="open-outline"
-                  size={18}
-                  color={appTheme.secondaryText}
-                />
-              </Pressable>
-
-              <View style={themeStyle(styles.fontSizeControl)}>
-                <Pressable
-                  onPress={() => setFontSize((v) => Math.max(12, v - 1))}
-                  accessibilityRole="button"
-                  accessibilityLabel="Decrease font size"
-                  hitSlop={6}
-                >
-                  <Ionicons
-                    name="remove"
-                    size={17}
-                    color={appTheme.secondaryText}
-                  />
-                </Pressable>
-
-                <Text style={themeStyle(styles.fontSizeText)}>A</Text>
-
-                <Pressable
-                  onPress={() => setFontSize((v) => Math.min(24, v + 1))}
-                  accessibilityRole="button"
-                  accessibilityLabel="Increase font size"
-                  hitSlop={6}
-                >
-                  <Ionicons
-                    name="add"
-                    size={17}
-                    color={appTheme.secondaryText}
-                  />
-                </Pressable>
-              </View>
-
-              <Text
-                style={[
-                  themeStyle(styles.characterCount),
-                  content.length === 0 &&
-                    themeStyle(styles.characterCountEmpty),
-                  content.length > 500 &&
-                    themeStyle(styles.characterCountWarning),
-                  content.length > 1000 &&
-                    themeStyle(styles.characterCountLimit),
-                ]}
-              >
-                {content.length} characters
-              </Text>
-            </ScrollView>
-          </View>
-
-          <View
-            style={[
-              themeStyle(uiStyles.contentField),
-              {
-                backgroundColor: quickNoteColor,
-                borderColor: `${personalAccentColor}55`,
-                borderRadius:
-                  defaultNoteCornerStyle === "square"
-                    ? 4
-                    : defaultNoteCornerStyle === "soft"
-                      ? 24
-                      : 14,
-              },
-            ]}
-          >
-            {noteBackgroundImageUri && (
-              <Image
-                pointerEvents="none"
-                source={{ uri: noteBackgroundImageUri }}
-                style={StyleSheet.absoluteFill}
-                resizeMode="cover"
-              />
-            )}
-            {noteBackgroundImageUri && (
-              <View
-                pointerEvents="none"
-                style={[
-                  StyleSheet.absoluteFill,
-                  { backgroundColor: "rgba(255,255,255,0.35)" },
-                ]}
-              />
-            )}
-            {!noteBackgroundImageUri && notePattern === "lined" && (
-              <View
-                pointerEvents="none"
-                style={themeStyle(uiStyles.editorPatternOverlay)}
-              >
-                {Array.from({ length: 10 }, (_, i) => (
-                  <View key={i} style={themeStyle(uiStyles.editorLine)} />
-                ))}
-              </View>
-            )}
-            {!noteBackgroundImageUri && notePattern === "grid" && (
-              <View
-                pointerEvents="none"
-                style={themeStyle(uiStyles.editorGridOverlay)}
-              >
-                {Array.from({ length: 12 }, (_, i) => (
-                  <View
-                    key={`v${i}`}
-                    style={[
-                      themeStyle(uiStyles.editorGridLine),
-                      { left: `${(i + 1) * 8}%`, top: 0, bottom: 0, width: 1 },
-                    ]}
-                  />
-                ))}
-                {Array.from({ length: 10 }, (_, i) => (
-                  <View
-                    key={`h${i}`}
-                    style={[
-                      themeStyle(uiStyles.editorGridLine),
-                      { top: (i + 1) * 18, left: 0, right: 0, height: 1 },
-                    ]}
-                  />
-                ))}
-              </View>
-            )}
-            {!noteBackgroundImageUri && notePattern === "dotted" && (
-              <View
-                pointerEvents="none"
-                style={themeStyle(uiStyles.editorPatternOverlay)}
-              >
-                {Array.from({ length: 8 }, (_, i) => (
-                  <View key={i} style={themeStyle(uiStyles.dotRow)}>
-                    <Text style={themeStyle(uiStyles.dotRowText)}>
-                      {"·     ·     ·     ·     ·     ·     ·     ·     ·"}
-                    </Text>
-                  </View>
-                ))}
-              </View>
-            )}
-            <Ionicons name="document-text-outline" size={27} color="#536176" />
-            <TextInput
-              ref={contentInputRef}
-              value={content}
-              onChangeText={handleContentChange}
-              onSelectionChange={(event) =>
-                setSelection(event.nativeEvent.selection)
-              }
-              placeholder="Write your note here..."
-              placeholderTextColor="#A0A8B4"
-              multiline
-              maxLength={2000}
-              textAlignVertical="top"
-              style={[
-                themeStyle(uiStyles.contentInput),
-                {
-                  fontSize:
-                    defaultNoteTextSize === "small"
-                      ? 14
-                      : defaultNoteTextSize === "large"
-                        ? 19
-                        : 16,
-                },
-                defaultNotebookStyle === "journal" && { fontStyle: "italic" },
-                {
-                  color: textColor,
-                  fontSize,
-                  fontWeight: bold ? "700" : "400",
-                  fontStyle: italic ? "italic" : "normal",
-                  textDecorationLine: underline
-                    ? "underline"
-                    : strikethrough
-                      ? "line-through"
-                      : "none",
-                  fontFamily: fontFamily === "System" ? undefined : fontFamily,
-                  textAlign: alignment,
-                  lineHeight: lineSpacing,
-                  letterSpacing,
-                },
-              ]}
-            />
-            <Text style={themeStyle(uiStyles.contentCounter)}>
-              {content.length}/2000
-            </Text>
-          </View>
-
-          <View style={themeStyle(uiStyles.fontSizePanel)}>
-            {/* Header */}
-            <View style={themeStyle(uiStyles.fontSizeHeader)}>
-              <View style={themeStyle(uiStyles.fontSizeIconBox)}>
-                <Ionicons name="text-outline" size={25} color="#138A78" />
-              </View>
-
-              <View style={themeStyle(uiStyles.fontSizeCopy)}>
-                <Text style={themeStyle(uiStyles.fontSizeTitle)}>
-                  Reading & Typography
-                </Text>
-                <Text style={themeStyle(uiStyles.fontSizeSubtitle)}>
-                  Make your notes easier to read
-                </Text>
-              </View>
-
-              <View style={themeStyle(uiStyles.fontSizeBadge)}>
-                <Ionicons name="eye-outline" size={17} color="#138A78" />
-              </View>
-            </View>
-
-            {/* Font preview */}
-            <View style={themeStyle(uiStyles.fontSizePreview)}>
-              <View style={themeStyle(uiStyles.fontSizePreviewHeader)}>
-                <Text style={themeStyle(uiStyles.fontSizePreviewLabel)}>
-                  LIVE PREVIEW
-                </Text>
-                <Text style={themeStyle(uiStyles.fontSizeValue)}>
-                  {fontSize} px
-                </Text>
-              </View>
-
-              <Text
-                style={[themeStyle(uiStyles.fontSizePreviewText), { fontSize }]}
-                numberOfLines={2}
-              >
-                Your notes, your reading comfort.
-              </Text>
-            </View>
-
-            {/* Font size controls */}
-            <View style={themeStyle(uiStyles.fontSizeControlRow)}>
-              <View style={themeStyle(uiStyles.fontSizeControlCopy)}>
-                <Text style={themeStyle(uiStyles.fontSizeControlTitle)}>
-                  Text size
-                </Text>
-                <Text style={themeStyle(uiStyles.fontSizeControlSubtitle)}>
-                  Choose a comfortable size
-                </Text>
-              </View>
-
-              <View style={themeStyle(uiStyles.fontSizeControls)}>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Decrease font size"
-                  accessibilityState={{ disabled: fontSize <= 12 }}
-                  disabled={fontSize <= 12}
-                  onPress={() => setFontSize((size) => Math.max(12, size - 2))}
-                  style={({ pressed }) => [
-                    themeStyle(uiStyles.fontSizeButton),
-                    fontSize <= 12 && themeStyle(uiStyles.disabledControl),
-                    pressed &&
-                      fontSize > 12 &&
-                      themeStyle(uiStyles.fontSizeButtonPressed),
-                  ]}
-                >
-                  <Ionicons
-                    name="remove"
-                    size={22}
-                    color={fontSize <= 12 ? "#AAB9B5" : "#176B5D"}
-                  />
-                </Pressable>
-
-                <Text style={themeStyle(uiStyles.fontSizeControlValue)}>
-                  {fontSize}
-                </Text>
-
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Increase font size"
-                  accessibilityState={{ disabled: fontSize >= 32 }}
-                  disabled={fontSize >= 32}
-                  onPress={() => setFontSize((size) => Math.min(32, size + 2))}
-                  style={({ pressed }) => [
-                    themeStyle(uiStyles.fontSizeButton),
-                    fontSize >= 32 && themeStyle(uiStyles.disabledControl),
-                    pressed &&
-                      fontSize < 32 &&
-                      themeStyle(uiStyles.fontSizeButtonPressed),
-                  ]}
-                >
-                  <Ionicons
-                    name="add"
-                    size={22}
-                    color={fontSize >= 32 ? "#AAB9B5" : "#176B5D"}
-                  />
-                </Pressable>
-              </View>
-            </View>
-
-            {/* Size range */}
-            <View style={themeStyle(uiStyles.fontSizeRangeRow)}>
-              <Text style={themeStyle(uiStyles.fontSizeRangeLabel)}>Small</Text>
-
-              <View style={themeStyle(uiStyles.fontSizeRangeTrack)}>
-                <View
-                  style={[
-                    themeStyle(uiStyles.fontSizeRangeFill),
-                    { width: `${((fontSize - 12) / 20) * 100}%` },
-                  ]}
-                />
-              </View>
-
-              <Text style={themeStyle(uiStyles.fontSizeRangeLabel)}>Large</Text>
-            </View>
-          </View>
-
-          <View style={themeStyle(uiStyles.contentMetrics)}>
-            <View style={themeStyle(uiStyles.metricPill)}>
-              <Ionicons
-                name="document-text-outline"
-                size={15}
-                color="#16866D"
-              />
-              <Text style={themeStyle(uiStyles.metricText)}>
-                {content.trim() ? content.trim().split(/\s+/).length : 0} words
-              </Text>
-            </View>
-            <View style={themeStyle(uiStyles.metricPill)}>
-              <Ionicons name="time-outline" size={15} color="#16866D" />
-              <Text style={themeStyle(uiStyles.metricText)}>
-                {Math.max(
-                  1,
-                  Math.ceil(
-                    (content.trim() ? content.trim().split(/\s+/).length : 0) /
-                      200,
-                  ),
-                )}{" "}
-                min read
-              </Text>
-            </View>
-            <View style={themeStyle(uiStyles.metricPill)}>
-              <Ionicons name="text-outline" size={15} color="#16866D" />
-              <Text style={themeStyle(uiStyles.metricText)}>
-                {content.length} characters
-              </Text>
-            </View>
-          </View>
-
-          <View style={themeStyle(uiStyles.featureSection)}>
-            <View style={themeStyle(uiStyles.featureHeadingRow)}>
-              <View>
-                <Text style={themeStyle(uiStyles.featureTitle)}>
-                  Paper style
-                </Text>
-                <Text style={themeStyle(uiStyles.featureSubtitle)}>
-                  Choose a background pattern for your note
-                </Text>
-              </View>
-              <Ionicons
-                name="color-palette-outline"
-                size={22}
-                color="#138A78"
-              />
-            </View>
-            <View style={themeStyle(uiStyles.patternRow)}>
-              {(["plain", "lined", "dotted", "grid"] as const).map(
-                (pattern) => (
-                  <Pressable
-                    key={pattern}
-                    onPress={() => setNotePattern(pattern)}
-                    style={[
-                      themeStyle(uiStyles.patternOption),
-                      notePattern === pattern &&
-                        themeStyle(uiStyles.patternOptionActive),
-                    ]}
-                  >
-                    <View
-                      style={[
-                        themeStyle(uiStyles.patternPreview),
-                        { backgroundColor: quickNoteColor },
-                        notePattern === pattern &&
-                          themeStyle(uiStyles.patternPreviewActive),
-                      ]}
-                    >
-                      {pattern === "lined" &&
-                        Array.from({ length: 4 }, (_, i) => (
-                          <View
-                            key={i}
-                            style={themeStyle(uiStyles.previewLine)}
-                          />
-                        ))}
-                      {pattern === "grid" && (
-                        <>
-                          <View
-                            style={themeStyle(uiStyles.previewGridVertical)}
-                          />
-                          <View
-                            style={themeStyle(uiStyles.previewGridHorizontal)}
-                          />
-                        </>
-                      )}
-                      {pattern === "dotted" && (
-                        <Text style={themeStyle(uiStyles.previewDots)}>
-                          · · ·{`\n`}· · ·{`\n`}· · ·
-                        </Text>
-                      )}
-                      {pattern === "plain" && (
-                        <Ionicons
-                          name="remove-outline"
-                          size={21}
-                          color="#82928D"
-                        />
-                      )}
-                    </View>
                     <Text
                       style={[
-                        themeStyle(uiStyles.patternLabel),
-                        notePattern === pattern &&
-                          themeStyle(uiStyles.patternLabelActive),
+                        themeStyle(styles.toolText),
+                        { textDecorationLine: "line-through" },
                       ]}
                     >
-                      {pattern[0].toUpperCase() + pattern.slice(1)}
+                      S
                     </Text>
-                    {notePattern === pattern && (
-                      <Ionicons
-                        name="checkmark-circle"
-                        size={15}
-                        color="#118A75"
-                      />
-                    )}
                   </Pressable>
-                ),
-              )}
-            </View>
-          </View>
 
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Open attachment options"
-            onPress={() => setAttachmentModalVisible(true)}
-            style={({ pressed }) => [
-              themeStyle(uiStyles.attachmentLauncher),
-              pressed && themeStyle(uiStyles.attachmentLauncherPressed),
-            ]}
-          >
-            <View style={themeStyle(uiStyles.attachmentLauncherIcon)}>
-              <Ionicons name="attach-outline" size={24} color="#07876E" />
-            </View>
-            <View style={themeStyle(uiStyles.attachmentLauncherCopy)}>
-              <Text style={themeStyle(uiStyles.attachmentLauncherTitle)}>
-                Add attachment
-              </Text>
-              <Text style={themeStyle(uiStyles.attachmentLauncherSubtitle)}>
-                Image, video, voice, handwriting or file
-              </Text>
-            </View>
-            <View style={themeStyle(uiStyles.attachmentLauncherAction)}>
-              <Ionicons name="add" size={23} color="#FFFFFF" />
-            </View>
-          </Pressable>
-
-          {imageUri || videoUri || voiceUri || drawingUri ? (
-            <View style={themeStyle(uiStyles.attachmentTray)}>
-              {imageUri ? (
-                <View style={themeStyle(uiStyles.attachmentPreview)}>
-                  <Image
-                    source={{ uri: imageUri }}
-                    style={themeStyle(uiStyles.previewImage)}
-                  />
                   <Pressable
-                    style={themeStyle(uiStyles.removeAttachment)}
-                    onPress={() => setImageUri(null)}
-                  >
-                    <Ionicons name="close" size={17} color="#243B43" />
-                  </Pressable>
-                </View>
-              ) : null}
-              {videoUri ? (
-                <View
-                  style={[
-                    themeStyle(uiStyles.attachmentPreview),
-                    themeStyle(uiStyles.filePreview),
-                    { backgroundColor: "#F0EAFE" },
-                  ]}
-                >
-                  <Ionicons name="play-circle" size={35} color="#7850CB" />
-                  <Text style={themeStyle(uiStyles.previewLabel)}>
-                    Video attached
-                  </Text>
-                  <Pressable
-                    style={themeStyle(uiStyles.removeAttachment)}
-                    onPress={() => setVideoUri(null)}
-                  >
-                    <Ionicons name="close" size={17} color="#243B43" />
-                  </Pressable>
-                </View>
-              ) : null}
-              {voiceUri ? (
-                <View
-                  style={[
-                    themeStyle(uiStyles.attachmentPreview),
-                    themeStyle(uiStyles.filePreview),
-                    { backgroundColor: "#FDE9F2" },
-                  ]}
-                >
-                  <Pressable
-                    onPress={() => {
-                      void togglePlayback();
-                    }}
-                    hitSlop={10}
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => setColorPaletteVisible(true)}
                     accessibilityRole="button"
-                    accessibilityLabel={
-                      playerStatus.playing
-                        ? "Pause voice note"
-                        : "Play voice note"
-                    }
+                    accessibilityLabel="Open text color palette"
                   >
                     <Ionicons
-                      name={
-                        playerStatus.playing ? "pause-circle" : "play-circle"
-                      }
-                      size={32}
-                      color="#D92B70"
+                      name="color-palette-outline"
+                      size={19}
+                      color={textColor}
                     />
                   </Pressable>
 
-                  <Text style={themeStyle(uiStyles.previewLabel)}>
-                    {playerStatus.playing ? "Playing voice note" : "Voice note"}
-                  </Text>
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => setFontPickerVisible(true)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Choose font family"
+                  >
+                    <Ionicons
+                      name="text-outline"
+                      size={19}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+                </ScrollView>
+
+                <View style={themeStyle(styles.toolbarSeparator)} />
+
+                {/* Row 2: Paragraph and lists */}
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  contentContainerStyle={themeStyle(styles.toolbarRow)}
+                >
+                  <Text style={themeStyle(styles.toolbarLabel)}>PARAGRAPH</Text>
+
+                  {/* Text Alignment */}
+                  {(
+                    [
+                      ["left", "Align left", "menu-outline"],
+                      ["center", "Align center", "reorder-three-outline"],
+                      ["right", "Align right", "menu-outline"],
+                    ] as const
+                  ).map(([value, label, iconName]) => (
+                    <Pressable
+                      key={value}
+                      accessibilityRole="button"
+                      accessibilityLabel={label}
+                      accessibilityState={{ selected: alignment === value }}
+                      style={[
+                        themeStyle(styles.toolButton),
+                        alignment === value &&
+                          themeStyle(styles.toolButtonActive),
+                      ]}
+                      onPress={() => setAlignment(value)}
+                    >
+                      <Ionicons
+                        name={iconName}
+                        size={19}
+                        color={
+                          alignment === value
+                            ? personalAccentColor
+                            : appTheme.secondaryText
+                        }
+                        style={
+                          value === "right"
+                            ? { transform: [{ scaleX: -1 }] }
+                            : undefined
+                        }
+                      />
+                    </Pressable>
+                  ))}
+
+                  {/* Normal Text */}
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => {
+                      // Switch the editor to normal multiline typing without changing content.
+                      setIsNormalTextMode(true);
+                      setIsBulletMode(false);
+                      setIsNumberedListMode(false);
+                      setIsChecklistMode(false);
+                      setListNumber(1);
+
+                      setBold(false);
+                      setItalic(false);
+                      setUnderline(false);
+                      setStrikethrough(false);
+
+                      setAlignment("left");
+
+                      // Keep the existing valid notebook style.
+                      // Do not use setDefaultNotebookStyle("normal")
+                      // unless "normal" is included in its TypeScript type.
+
+                      requestAnimationFrame(() => {
+                        requestAnimationFrame(() => {
+                          contentInputRef.current?.focus();
+                        });
+                      });
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Normal text"
+                  >
+                    <Ionicons
+                      name="text-outline"
+                      size={19}
+                      color={appTheme.secondaryText}
+                    />
+                    <Text style={themeStyle(styles.toolText)}>Normal Text</Text>
+                  </Pressable>
+
+                  {/* Bullet List */}
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => {
+                      setIsNormalTextMode(true);
+                      setIsNumberedListMode(false);
+                      setIsChecklistMode(false);
+                      setIsBulletMode(true);
+
+                      // Current cursor position
+                      const cursorPosition =
+                        Math.min(selection.start, selection.end) + 2;
+
+                      // Insert bullet
+                      replaceSelection("• ");
+
+                      // Move cursor after bullet
+                      requestAnimationFrame(() => {
+                        setSelection({
+                          start: cursorPosition,
+                          end: cursorPosition,
+                        });
+
+                        contentInputRef.current?.focus();
+                      });
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Insert bullet list"
+                  >
+                    <Text style={themeStyle(styles.toolText)}>• List</Text>
+                  </Pressable>
+
+                  {/* Numbered List */}
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => {
+                      setIsNormalTextMode(true);
+                      setIsBulletMode(false);
+                      setIsChecklistMode(false);
+                      setIsNumberedListMode(true);
+                      setListNumber(2);
+
+                      replaceSelection("1. ");
+
+                      requestAnimationFrame(() => {
+                        contentInputRef.current?.focus();
+                      });
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Insert numbered list"
+                  >
+                    <Text style={themeStyle(styles.toolText)}>1. List</Text>
+                  </Pressable>
+
+                  {/* Checklist Toggle Button */}
 
                   <Pressable
-                    style={themeStyle(uiStyles.removeAttachment)}
-                    onPress={() => setVoiceUri(null)}
-                    hitSlop={8}
+                    style={[
+                      themeStyle(styles.toolButton),
+                      isChecklistMode && {
+                        backgroundColor: "#DDF7EC",
+                        borderRadius: 10,
+                      },
+                    ]}
+                    onPress={insertChecklist}
+                    accessibilityRole="button"
+                    accessibilityLabel="Insert checklist"
                   >
-                    <Ionicons name="close" size={17} color="#243B43" />
+                    <Ionicons
+                      name="checkbox-outline"
+                      size={20}
+                      color={appTheme.secondaryText}
+                    />
+                    <Text style={themeStyle(styles.toolText)}>Checklist</Text>
                   </Pressable>
-                </View>
-              ) : null}
-              {drawingUri ? (
-                <View style={themeStyle(uiStyles.attachmentPreview)}>
-                  <Image
-                    source={{ uri: drawingUri }}
-                    style={themeStyle(uiStyles.previewImage)}
-                  />
+
+                  {/* Reorder Checklist */}
                   <Pressable
-                    style={themeStyle(uiStyles.removeAttachment)}
-                    onPress={() => setDrawingUri(null)}
+                    style={themeStyle(styles.toolButton)}
+                    onPress={openChecklistReorder}
+                    accessibilityRole="button"
+                    accessibilityLabel="Reorder checklist items"
                   >
-                    <Ionicons name="close" size={17} color="#243B43" />
+                    <Ionicons
+                      name="reorder-three-outline"
+                      size={19}
+                      color={appTheme.secondaryText}
+                    />
+                    <Text style={themeStyle(styles.toolText)}>Reorder</Text>
                   </Pressable>
-                </View>
-              ) : null}
-              <Pressable
+
+                  {/* Decrease Indent */}
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => changeIndent("decrease")}
+                    accessibilityRole="button"
+                    accessibilityLabel="Decrease indent"
+                  >
+                    <Ionicons
+                      name="return-up-back-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  {/* Increase Indent */}
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => changeIndent("increase")}
+                    accessibilityRole="button"
+                    accessibilityLabel="Increase indent"
+                  >
+                    <Ionicons
+                      name="return-down-forward-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  {/* Spacing */}
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => setSpacingModalVisible(true)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Adjust text spacing"
+                  >
+                    <Ionicons
+                      name="menu-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                    <Text style={themeStyle(styles.spacingButtonLabel)}>
+                      Spacing
+                    </Text>
+                  </Pressable>
+                </ScrollView>
+
+                {/* Checklist Reorder Panel */}
+                {reorderChecklistVisible && (
+                  <View
+                    style={{
+                      marginVertical: 12,
+                      padding: 12,
+                      borderRadius: 12,
+                      borderWidth: 1,
+                      borderColor: appTheme.primary,
+                      backgroundColor: appTheme.surface,
+                    }}
+                  >
+                    <Text
+                      style={{
+                        color: appTheme.text,
+                        fontSize: 17,
+                        fontWeight: "700",
+                        marginBottom: 10,
+                      }}
+                    >
+                      Reorder Checklist Items
+                    </Text>
+
+                    {reorderChecklistItems.length === 0 ? (
+                      <Text style={{ color: mintTheme.subtitle }}>
+                        No checkbox items found in your note.
+                      </Text>
+                    ) : (
+                      <DraggableFlatList
+                        data={reorderChecklistItems}
+                        keyExtractor={(item) => item.id}
+                        activationDistance={8}
+                        scrollEnabled={false}
+                        onDragEnd={({ data }) => {
+                          saveChecklistReorder(data);
+                        }}
+                        renderItem={({ item, drag, isActive }) => (
+                          <ScaleDecorator>
+                            <View
+                              style={{
+                                flexDirection: "row",
+                                alignItems: "center",
+                                padding: 8,
+                                marginBottom: 6,
+                                borderRadius: 8,
+                                backgroundColor: isActive
+                                  ? `${appTheme.primary}20`
+                                  : appTheme.surface,
+                              }}
+                            >
+                              <Pressable
+                                onPress={() => {
+                                  const updated = reorderChecklistItems.map(
+                                    (entry) =>
+                                      entry.id === item.id
+                                        ? {
+                                            ...entry,
+                                            checked: !entry.checked,
+                                          }
+                                        : entry,
+                                  );
+
+                                  saveChecklistReorder(updated);
+                                }}
+                                accessibilityRole="checkbox"
+                                accessibilityState={{
+                                  checked: item.checked,
+                                }}
+                              >
+                                <Ionicons
+                                  name={
+                                    item.checked ? "checkbox" : "square-outline"
+                                  }
+                                  size={23}
+                                  color={appTheme.primary}
+                                />
+                              </Pressable>
+
+                              <Text
+                                style={{
+                                  flex: 1,
+                                  marginHorizontal: 10,
+                                  color: appTheme.text,
+                                  textDecorationLine: item.checked
+                                    ? "line-through"
+                                    : "none",
+                                }}
+                              >
+                                {item.text || "Untitled item"}
+                              </Text>
+
+                              <Pressable
+                                onLongPress={drag}
+                                delayLongPress={150}
+                                disabled={isActive}
+                                accessibilityRole="button"
+                                accessibilityLabel={`Move ${item.text}`}
+                                hitSlop={8}
+                                style={{ padding: 6 }}
+                              >
+                                <Ionicons
+                                  name="reorder-three-outline"
+                                  size={25}
+                                  color={appTheme.secondaryText}
+                                />
+                              </Pressable>
+                            </View>
+                          </ScaleDecorator>
+                        )}
+                      />
+                    )}
+
+                    <Pressable
+                      onPress={() => setReorderChecklistVisible(false)}
+                      style={{
+                        alignSelf: "flex-end",
+                        marginTop: 10,
+                        paddingHorizontal: 16,
+                        paddingVertical: 9,
+                        borderRadius: 8,
+                        backgroundColor: appTheme.primary,
+                      }}
+                    >
+                      <Text
+                        style={{
+                          color: "#FFFFFF",
+                          fontWeight: "600",
+                        }}
+                      >
+                        Done
+                      </Text>
+                    </Pressable>
+                  </View>
+                )}
+
+                <View style={themeStyle(styles.toolbarSeparator)} />
+
+                {/* Row 3: Editing tools */}
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  contentContainerStyle={themeStyle(styles.toolbarRow)}
+                >
+                  <Text style={themeStyle(styles.toolbarLabel)}>EDIT</Text>
+
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={undoEdit}
+                    accessibilityRole="button"
+                    accessibilityLabel="Undo"
+                  >
+                    <Ionicons
+                      name="arrow-undo-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={redoEdit}
+                    accessibilityRole="button"
+                    accessibilityLabel="Redo"
+                  >
+                    <Ionicons
+                      name="arrow-redo-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => void copyContent()}
+                    accessibilityRole="button"
+                    accessibilityLabel="Copy"
+                  >
+                    <Ionicons
+                      name="copy-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => void pasteContent()}
+                    accessibilityRole="button"
+                    accessibilityLabel="Paste"
+                  >
+                    <Ionicons
+                      name="clipboard-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => void cutSelection()}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cut"
+                  >
+                    <Ionicons
+                      name="cut-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                 <Pressable
+  style={themeStyle(styles.toolButton)}
+  onPress={() => {
+    const fullLength = content.length;
+    const range = {
+      start: 0,
+      end: fullLength,
+    };
+
+    // Update React Native selection state
+    setSelection(range);
+
+    // Focus the editor
+    contentInputRef.current?.focus();
+
+    // Apply selection after the desktop editor receives focus
+    requestAnimationFrame(() => {
+      const input = contentInputRef.current as any;
+
+      if (input?.setSelectionRange) {
+        input.setSelectionRange(0, fullLength);
+      } else if (input?.getNode?.()?.setSelectionRange) {
+        input.getNode().setSelectionRange(0, fullLength);
+      } else {
+        input?.setNativeProps?.({
+          selection: range,
+        });
+      }
+    });
+  }}
+  accessibilityRole="button"
+  accessibilityLabel="Select all"
+>
+  <Ionicons
+    name="scan-outline"
+    size={18}
+    color={appTheme.secondaryText}
+  />
+</Pressable>
+
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={insertHyperlink}
+                    accessibilityRole="button"
+                    accessibilityLabel="Insert hyperlink"
+                  >
+                    <Ionicons
+                      name="link-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  <Pressable
+                    style={themeStyle(styles.toolButton)}
+                    onPress={() => void openFirstHyperlink()}
+                    accessibilityRole="button"
+                    accessibilityLabel="Open URL"
+                  >
+                    <Ionicons
+                      name="open-outline"
+                      size={18}
+                      color={appTheme.secondaryText}
+                    />
+                  </Pressable>
+
+                  <View style={themeStyle(styles.fontSizeControl)}>
+                    <Pressable
+                      onPress={() => setFontSize((v) => Math.max(12, v - 1))}
+                      accessibilityRole="button"
+                      accessibilityLabel="Decrease font size"
+                      disabled={fontSize <= 12}
+                      hitSlop={8}
+                      style={({ pressed }) => [
+                        styles.fontSizeButton,
+                        fontSize <= 12 && styles.fontSizeButtonDisabled,
+                        pressed &&
+                          fontSize > 12 &&
+                          styles.fontSizeButtonPressed,
+                      ]}
+                    >
+                      <Ionicons
+                        name="remove"
+                        size={18}
+                        color={fontSize <= 12 ? "#A8B5AE" : "#287653"}
+                      />
+                    </Pressable>
+
+                    <View style={styles.fontSizeValueBox}>
+                      <Text style={themeStyle(styles.fontSizeText)}>
+                        {fontSize}
+                      </Text>
+                      <Text style={styles.fontSizeUnit}>px</Text>
+                    </View>
+
+                    <Pressable
+                      onPress={() => setFontSize((v) => Math.min(24, v + 1))}
+                      accessibilityRole="button"
+                      accessibilityLabel="Increase font size"
+                      disabled={fontSize >= 24}
+                      hitSlop={8}
+                      style={({ pressed }) => [
+                        styles.fontSizeButton,
+                        fontSize >= 24 && styles.fontSizeButtonDisabled,
+                        pressed &&
+                          fontSize < 24 &&
+                          styles.fontSizeButtonPressed,
+                      ]}
+                    >
+                      <Ionicons
+                        name="add"
+                        size={18}
+                        color={fontSize >= 24 ? "#A8B5AE" : "#287653"}
+                      />
+                    </Pressable>
+                  </View>
+
+                  <Text
+                    style={[
+                      themeStyle(styles.characterCount),
+                      content.length === 0 &&
+                        themeStyle(styles.characterCountEmpty),
+                      content.length > 500 &&
+                        themeStyle(styles.characterCountWarning),
+                      content.length > 1000 &&
+                        themeStyle(styles.characterCountLimit),
+                    ]}
+                  >
+                    {content.length} characters
+                  </Text>
+                </ScrollView>
+              </View>
+
+              <View
+                collapsable={false}
                 style={[
-                  themeStyle(uiStyles.attachmentPreview),
-                  themeStyle(uiStyles.addMore),
+                  themeStyle(uiStyles.contentField),
+                  {
+                    backgroundColor: quickNoteColor,
+                    borderColor:
+                      defaultNotebookStyle === "minimal"
+                        ? "transparent"
+                        : defaultNotebookStyle === "journal"
+                          ? `${personalAccentColor}99`
+                          : `${personalAccentColor}55`,
+                    borderWidth:
+                      defaultNotebookStyle === "minimal"
+                        ? 0
+                        : defaultNotebookStyle === "journal"
+                          ? 1.5
+                          : 1,
+                    borderLeftWidth:
+                      defaultNotebookStyle === "journal" ? 5 : undefined,
+                    padding: isDesktop ? 24 : isNarrowPhone ? 10 : 14,
+                    paddingLeft: isDesktop
+                      ? defaultNotebookStyle === "journal"
+                        ? 28
+                        : 24
+                      : isNarrowPhone
+                        ? defaultNotebookStyle === "journal"
+                          ? 14
+                          : 10
+                        : defaultNotebookStyle === "journal"
+                          ? 18
+                          : 14,
+                    paddingBottom: isDesktop ? 48 : isNarrowPhone ? 32 : 38,
+                    minHeight: isDesktop ? 580 : undefined,
+                    width: "100%",
+                    borderRadius:
+                      defaultNoteCornerStyle === "square"
+                        ? 4
+                        : defaultNoteCornerStyle === "soft"
+                          ? 24
+                          : 14,
+                    shadowColor:
+                      defaultNotebookStyle === "classic"
+                        ? "#24483B"
+                        : "transparent",
+                    shadowOffset: {
+                      width: 0,
+                      height: defaultNotebookStyle === "classic" ? 3 : 0,
+                    },
+                    shadowOpacity: defaultNotebookStyle === "classic" ? 0.1 : 0,
+                    shadowRadius: defaultNotebookStyle === "classic" ? 7 : 0,
+                    elevation: defaultNotebookStyle === "classic" ? 2 : 0,
+                    position: "relative",
+                    overflow: "hidden",
+                  },
                 ]}
-                onPress={() => void pickImage()}
               >
-                <Ionicons name="add" size={34} color="#64748B" />
-                <Text style={themeStyle(uiStyles.previewLabel)}>Add More</Text>
-              </Pressable>
-            </View>
-          ) : null}
-
-          <View style={themeStyle(uiStyles.settingsGrid)}>
-            <SettingTile
-              icon="calendar-outline"
-              title="Due Date & Time"
-              subtitle={`${formattedDate || "Choose date"} · ${dueDateTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
-              tint="#18A98B"
-              bg="#E9F9F3"
-              onPress={openDatePicker}
-            />
-            <SettingTile
-              icon="notifications-outline"
-              title="Reminder"
-              subtitle={alarmDate ? toAlarmLabel(alarmDate) : "Set time"}
-              tint="#FF923F"
-              bg="#FFF5E9"
-              onPress={openReminderPicker}
-            />
-            <SettingTile
-              icon="color-palette-outline"
-              title="Note Theme"
-              subtitle={`${({ "#FFF4CC": "Warm", "#DDF7E8": "Fresh", "#DDEBFF": "Ocean", "#FCE1EE": "Blush", "#EDE2FF": "Lavender", "#FFFFFF": "Classic" } as Record<string, string>)[quickNoteColor] || "Custom"} · ${notePattern.charAt(0).toUpperCase()}${notePattern.slice(1)}`}
-              tint="#1686E8"
-              bg="#E8F4FF"
-              onPress={openNoteThemePicker}
-            />
-            <SettingTile
-              icon="albums-outline"
-              title="Template"
-              subtitle="Daily plan, checklist or journal"
-              tint="#0D8B78"
-              bg="#E5F8F2"
-              onPress={openNoteTemplatePicker}
-            />
-            <SettingTile
-              icon="create-outline"
-              title="Handwriting & Drawing"
-              subtitle={
-                drawingUri
-                  ? "Drawing attached · Tap to edit"
-                  : "Write, sketch or convert to text"
-              }
-              tint="#8B5CF6"
-              bg="#F1EBFF"
-              onPress={() => setDrawingModalVisible(true)}
-            />
-
-            {showDesktopDatePicker && (
-              <View
-                style={{
-                  padding: 16,
-                  marginVertical: 12,
-                  borderRadius: 12,
-                  backgroundColor: "#FFFFFF",
-                  borderWidth: 1,
-                  borderColor: "#DDE7E5",
-                  gap: 12,
-                }}
-              >
-                <Text style={{ fontSize: 16, fontWeight: "600" }}>
-                  {desktopPickerMode === "due"
-                    ? "Select due date and time"
-                    : "Select reminder"}
-                </Text>
-
-                <input
-                  type="date"
-                  defaultValue={
-                    toDateInput(
-                      desktopPickerMode === "due"
-                        ? dueDateTime || new Date()
-                        : alarmDate || new Date(Date.now() + 60 * 60 * 1000),
-                    ).split("T")[0]
-                  }
-                  onChange={(event) => {
-                    const datePart = event.currentTarget.value;
-                    if (!datePart) return;
-
-                    const current =
-                      desktopPickerMode === "due" ? dueDateTime : alarmDate;
-                    const result = current ? new Date(current) : new Date();
-
-                    const [year, month, day] = datePart.split("-").map(Number);
-                    result.setFullYear(year, month - 1, day);
-
-                    if (desktopPickerMode === "due") {
-                      setDueDateTime(result);
-                      setTodoDate(toDateInput(result));
-                      setDateText(toDateInput(result));
-                    } else {
-                      setAlarmDate(result);
+                {/* Background image */}
+                {noteBackgroundImageUri ? (
+                  <Image
+                    pointerEvents="none"
+                    source={{ uri: noteBackgroundImageUri }}
+                    resizeMode="cover"
+                    style={[
+                      StyleSheet.absoluteFillObject,
+                      {
+                        zIndex: 0,
+                      },
+                    ]}
+                  />
+                ) : (
+                  /* Selected theme pattern - visible before saving */
+                  <NotePattern
+                    pattern={notePattern}
+                    ink={
+                      quickNoteColor.toLowerCase() === "#25283d" ||
+                      quickNoteColor.toLowerCase() === "#303a63"
+                        ? "rgba(255,255,255,0.55)"
+                        : "rgba(65,94,82,0.40)"
                     }
-                  }}
-                  style={{ padding: 10, fontSize: 15 }}
-                />
+                  />
+                )}
 
-                <input
-                  type="time"
-                  defaultValue={(() => {
-                    const date =
-                      desktopPickerMode === "due"
-                        ? dueDateTime || new Date()
-                        : alarmDate || new Date(Date.now() + 60 * 60 * 1000);
-
-                    return `${String(date.getHours()).padStart(2, "0")}:${String(
-                      date.getMinutes(),
-                    ).padStart(2, "0")}`;
-                  })()}
-                  onChange={(event) => {
-                    const timePart = event.currentTarget.value;
-                    if (!timePart) return;
-
-                    const [hours, minutes] = timePart.split(":").map(Number);
-                    const result = new Date(
-                      desktopPickerMode === "due"
-                        ? dueDateTime || new Date()
-                        : alarmDate || new Date(),
-                    );
-
-                    result.setHours(hours, minutes, 0, 0);
-
-                    if (desktopPickerMode === "due") {
-                      setDueDateTime(result);
-                      setTodoDate(toDateInput(result));
-                      setDateText(toDateInput(result));
-                    } else {
-                      setAlarmDate(result);
-                    }
-                  }}
-                  style={{ padding: 10, fontSize: 15 }}
-                />
-
-                <Pressable
-                  onPress={() => setShowDesktopDatePicker(false)}
-                  style={{
-                    padding: 12,
-                    borderRadius: 8,
-                    backgroundColor: "#DDF5EE",
-                    alignItems: "center",
-                  }}
-                >
-                  <Text style={{ fontWeight: "600", color: "#008F83" }}>
-                    Done
-                  </Text>
-                </Pressable>
-              </View>
-            )}
-
-            {Platform.OS === "web" && showDesktopReminderPicker && (
-              <View
-                style={{
-                  padding: 16,
-                  marginVertical: 12,
-                  borderRadius: 12,
-                  borderWidth: 1,
-                  borderColor: "#DDE7E5",
-                  gap: 12,
-                }}
-              >
-                <Text style={{ fontSize: 16, fontWeight: "600" }}>
-                  Select reminder
-                </Text>
-
-                <input
-                  type="date"
-                  value={desktopReminderDate}
-                  min={new Date().toLocaleDateString("en-CA")}
-                  onChange={(event) =>
-                    setDesktopReminderDate(event.currentTarget.value)
-                  }
-                />
-
-                <input
-                  type="time"
-                  value={desktopReminderTime}
-                  onChange={(event) =>
-                    setDesktopReminderTime(event.currentTarget.value)
-                  }
-                />
-
-                <Pressable
-                  onPress={() => {
-                    if (!desktopReminderDate || !desktopReminderTime) return;
-
-                    const result = new Date(
-                      `${desktopReminderDate}T${desktopReminderTime}`,
-                    );
-
-                    if (
-                      Number.isNaN(result.getTime()) ||
-                      result.getTime() <= Date.now()
-                    ) {
-                      Alert.alert(
-                        "Choose a future time",
-                        "The reminder must be scheduled in the future.",
-                      );
-                      return;
-                    }
-
-                    setAlarmDate(result);
-                    setShowDesktopReminderPicker(false);
-
-                    Alert.alert(
-                      "Reminder selected",
-                      `${result.toLocaleDateString()} at ${result.toLocaleTimeString(
-                        [],
-                        { hour: "2-digit", minute: "2-digit" },
-                      )}\n\nSave the Todo to confirm your reminder.`,
-                    );
-                  }}
-                  style={{
-                    padding: 12,
-                    backgroundColor: "#DDF5EE",
-                    borderRadius: 8,
-                    alignItems: "center",
-                  }}
-                >
-                  <Text style={{ color: "#008F83", fontWeight: "600" }}>
-                    Confirm reminder
-                  </Text>
-                </Pressable>
-
-                <Pressable
-                  onPress={() => setShowDesktopReminderPicker(false)}
-                  style={{ padding: 8, alignItems: "center" }}
-                >
-                  <Text>Cancel</Text>
-                </Pressable>
-              </View>
-            )}
-            <View
-              style={[
-                uiStyles.recurringCard,
-                {
-                  backgroundColor: appTheme.surface,
-                  borderColor: appTheme.border,
-                },
-              ]}
-            >
-              <View style={uiStyles.recurringHeader}>
+                {/* Text input layer */}
                 <View
+                  pointerEvents="box-none"
+                  style={{
+                    flex: 1,
+                    minHeight: 190,
+                    zIndex: 1,
+                    flexDirection: "row",
+                    alignItems: "stretch",
+                    backgroundColor: "transparent",
+                  }}
+                >
+                  {showChecklistEditor ? (
+                    <View
+                      style={{
+                        flex: 1,
+                        minHeight: 190,
+                        backgroundColor: "transparent",
+                      }}
+                    >
+                      {checklistLines.map((line, index) => {
+                        const match = line.match(/^(\s*)(☐|☑)(?:\uFE0F)?(\s?)(.*)$/);
+                        const checked = match?.[2] === "☑";
+                        const prefixLength = match
+                          ? match[1].length + 1 + match[3].length
+                          : 0;
+                        const lineStart = checklistLines
+                          .slice(0, index)
+                          .reduce(
+                            (total, previousLine) =>
+                              total + previousLine.length + 1,
+                            0,
+                          );
+                        const inputValue = match ? match[4] : line;
+
+                        return (
+                          <View
+                            key={`checklist-line-${index}`}
+                            style={{
+                              flexDirection: "row",
+                              alignItems: "center",
+                              minHeight: Math.max(38, lineSpacing + 8),
+                              width: "100%",
+                            }}
+                          >
+                            {match ? (
+                              <Pressable
+                                onPress={() => toggleChecklistItem(index)}
+                                accessibilityRole="checkbox"
+                                accessibilityLabel={`Mark ${inputValue || "checklist item"} ${
+                                  checked ? "incomplete" : "complete"
+                                }`}
+                                accessibilityState={{ checked }}
+                                hitSlop={8}
+                                style={{
+                                  width: 34,
+                                  minHeight: 40,
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                }}
+                              >
+                                <Ionicons
+                                  name={checked ? "checkbox" : "square-outline"}
+                                  size={22}
+                                  color={
+                                    checked
+                                      ? appTheme.primary
+                                      : appTheme.secondaryText
+                                  }
+                                />
+                              </Pressable>
+                            ) : null}
+
+                           <TextInput
+  key={`${fontFamily ?? "System"}-${index}`}
+  ref={(ref) => {
+    checklistInputRefs.current[index] = ref;
+  }}
+  value={inputValue}
+  onChangeText={(value) =>
+    updateChecklistLine(index, value)
+  }
+  onKeyPress={(event) =>
+    handleChecklistKeyPress(index, event)
+  }
+  onSelectionChange={(event) => {
+    const local = event.nativeEvent.selection;
+
+    setSelection({
+      start: lineStart + prefixLength + local.start,
+      end: lineStart + prefixLength + local.end,
+    });
+  }}
+  onSubmitEditing={() =>
+    addChecklistItemAfter(index)
+  }
+  placeholder={match ? "Add checklist item..." : ""}
+  placeholderTextColor="#84918B"
+  multiline={false}
+  maxLength={2000}
+  returnKeyType="next"
+  blurOnSubmit={false}
+  autoCapitalize="sentences"
+  underlineColorAndroid="transparent"
+  style={[
+    themeStyle(uiStyles.contentInput),
+    {
+      flex: 1,
+      minWidth: 0,
+      minHeight: Math.max(38, lineSpacing + 8),
+      padding: 0,
+      paddingTop: 0,
+      backgroundColor: "transparent",
+      color: textColor,
+      fontSize,
+      fontWeight: bold ? "700" : "400",
+      fontStyle:
+        defaultNotebookStyle === "journal" || italic
+          ? "italic"
+          : "normal",
+      textDecorationLine: checked
+        ? "line-through"
+        : underline
+          ? "underline"
+          : strikethrough
+            ? "line-through"
+            : "none",
+      fontFamily:
+        fontFamily && fontFamily !== "System"
+          ? fontFamily
+          : defaultNotebookStyle === "journal"
+            ? "serif"
+            : undefined,
+      textAlign: alignment,
+      lineHeight: lineSpacing,
+      letterSpacing,
+    },
+  ]}
+/>
+                          </View>
+                        );
+                      })}
+                    </View>
+                  ) : (
+                    <TextInput
+                      ref={contentInputRef}
+                      value={content}
+                      onChangeText={handleContentChange}
+                      onSelectionChange={(event) => {
+                        setSelection(event.nativeEvent.selection);
+                      }}
+                      placeholder="Write your note here..."
+                      placeholderTextColor="#84918B"
+                      multiline
+                      maxLength={2000}
+                      textAlignVertical="top"
+                      autoCapitalize="sentences"
+                      underlineColorAndroid="transparent"
+                      style={[
+                        themeStyle(uiStyles.contentInput),
+                        {
+                          flex: 1,
+                          minWidth: 0,
+                          minHeight: 190,
+                          padding: 0,
+                          paddingTop: 0,
+                          backgroundColor: "transparent",
+                          color: textColor,
+                          fontSize,
+
+                          fontWeight: bold ? "700" : "400",
+                          fontStyle:
+                            defaultNotebookStyle === "journal" || italic
+                              ? "italic"
+                              : "normal",
+                          textDecorationLine: underline
+                            ? "underline"
+                            : strikethrough
+                              ? "line-through"
+                              : "none",
+                          fontFamily:
+                            !fontFamily || fontFamily === "System"
+                              ? undefined
+                              : fontFamily,
+                          textAlign: alignment,
+                          lineHeight: lineSpacing,
+                          letterSpacing,
+                        },
+                      ]}
+                    />
+                  )}
+                </View>
+
+                {/* Character counter */}
+                <Text
+                  pointerEvents="none"
                   style={[
-                    uiStyles.recurringIcon,
-                    { backgroundColor: "#FFF1E5" },
+                    themeStyle(uiStyles.contentCounter),
+                    {
+                      zIndex: 2,
+                    },
                   ]}
                 >
-                  <Ionicons name="repeat-outline" size={21} color="#E87924" />
-                </View>
-                <View style={{ flex: 1 }}>
+                  {content.length}/2000
+                </Text>
+              </View>
+
+           
+<View
+  style={[
+    themeStyle(uiStyles.contentMetrics),
+    {
+      flexWrap: "wrap",
+      rowGap: 6,
+      columnGap: isNarrowPhone ? 6 : 10,
+    },
+  ]}
+>
+  <View style={themeStyle(uiStyles.metricPill)}>
+    <Ionicons
+      name="document-text-outline"
+      size={15}
+      color="#16866D"
+    />
+    <Text style={themeStyle(uiStyles.metricText)}>
+      {
+        content
+          .replace(/(^|\n)\s*[☐☑]\s*/g, "$1")
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean).length
+      }{" "}
+      words
+    </Text>
+  </View>
+
+  <View style={themeStyle(uiStyles.metricPill)}>
+    <Ionicons
+      name="text-outline"
+      size={15}
+      color="#16866D"
+    />
+    <Text style={themeStyle(uiStyles.metricText)}>
+      {content.length} characters
+    </Text>
+  </View>
+</View>
+
+            </View>
+
+            {/* Desktop sidebar: attachments, scheduling and save actions */}
+            <View
+              style={{
+                width: isDesktop ? 340 : "100%",
+                maxWidth: isDesktop ? 380 : undefined,
+                flexShrink: 0,
+                gap: isDesktop ? 14 : 0,
+                marginTop: isDesktop ? 0 : 16,
+                ...(isDesktop
+                  ? {
+                      padding: 18,
+                      backgroundColor: mintTheme.surface,
+                      borderWidth: 1,
+                      borderColor: mintTheme.border,
+                      borderRadius: 24,
+                      shadowColor: "#173F38",
+                      shadowOffset: { width: 0, height: 8 },
+                      shadowOpacity: 0.04,
+                      shadowRadius: 18,
+                      elevation: 2,
+                    }
+                  : {}),
+              }}
+            >
+              {isDesktop ? (
+                <View style={{ marginBottom: 2 }}>
                   <Text
-                    style={[uiStyles.recurringTitle, { color: appTheme.text }]}
+                    style={{
+                      color: mintTheme.primary,
+                      fontSize: 11,
+                      fontWeight: "800",
+                      letterSpacing: 1.4,
+                    }}
+                  >
+                    TASK DETAILS
+                  </Text>
+                  <Text
+                    style={{
+                      color: mintTheme.text,
+                      fontSize: 19,
+                      fontWeight: "800",
+                      marginTop: 5,
+                    }}
+                  >
+                    Organize your note
+                  </Text>
+                  <Text
+                    style={{
+                      color: mintTheme.subtitle,
+                      fontSize: 12,
+                      marginTop: 4,
+                      lineHeight: 18,
+                    }}
+                  >
+                    Schedule, personalize and add files.
+                  </Text>
+                </View>
+              ) : null}
+
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Open attachment options"
+                onPress={() => setAttachmentModalVisible(true)}
+                style={({ pressed }) => [
+                  themeStyle(uiStyles.attachmentLauncher),
+                  pressed && themeStyle(uiStyles.attachmentLauncherPressed),
+                ]}
+              >
+                <View style={themeStyle(uiStyles.attachmentLauncherIcon)}>
+                  <Ionicons name="attach-outline" size={24} color="#07876E" />
+                </View>
+                <View style={themeStyle(uiStyles.attachmentLauncherCopy)}>
+                  <Text style={themeStyle(uiStyles.attachmentLauncherTitle)}>
+                    Add attachment
+                  </Text>
+                  <Text style={themeStyle(uiStyles.attachmentLauncherSubtitle)}>
+                    Image, video, voice, handwriting or file
+                  </Text>
+                </View>
+                <View style={themeStyle(uiStyles.attachmentLauncherAction)}>
+                  <Ionicons name="add" size={23} color="#FFFFFF" />
+                </View>
+              </Pressable>
+
+              {existingAttachments.length > 0 ||
+              imageUris.length > 0 ||
+              videoUris.length > 0 ||
+              attachedFiles.length > 0 ||
+              voiceUri ||
+              drawingUri ? (
+                <View style={themeStyle(uiStyles.attachmentTray)}>
+                  {existingAttachments.map((attachment, index) => {
+                    const normalizedType = attachment.type.toLowerCase().trim();
+                    const isImage =
+                      normalizedType.startsWith("image/") ||
+                      normalizedType === "image" ||
+                      /\\.(jpg|jpeg|png|webp|gif|bmp|heic|heif|avif)$/i.test(
+                        attachment.name,
+                      );
+                    const isVideo =
+                      normalizedType.startsWith("video/") ||
+                      normalizedType === "video" ||
+                      /\\.(mp4|mov|webm|m4v|avi)$/i.test(attachment.name);
+                    const isAudio =
+                      normalizedType.startsWith("audio/") ||
+                      normalizedType === "audio" ||
+                      /\\.(mp3|m4a|aac|wav|ogg|opus)$/i.test(attachment.name);
+
+                    return (
+                      <Pressable
+                        key={`existing-attachment-${attachment.id}-${index}`}
+                        style={[
+                          themeStyle(uiStyles.attachmentPreview),
+                          !isImage && themeStyle(uiStyles.filePreview),
+                          {
+                            backgroundColor: isImage
+                              ? "#E5F8F2"
+                              : isVideo
+                                ? "#F0EAFE"
+                                : isAudio
+                                  ? "#FDE9F2"
+                                  : "#EEF3F1",
+                          },
+                        ]}
+                        onPress={() => {
+                          void Linking.openURL(attachment.uri).catch(() => {
+                            showAlert(
+                              "Unable to open attachment",
+                              "The saved attachment could not be opened.",
+                            );
+                          });
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Open saved attachment ${attachment.name}`}
+                      >
+                        {isImage ? (
+                          <Image
+                            source={{ uri: attachment.uri }}
+                            style={themeStyle(uiStyles.previewImage)}
+                            resizeMode="cover"
+                            onError={(event) =>
+                              console.warn(
+                                "[Edit] Saved image attachment failed to load:",
+                                event.nativeEvent.error,
+                              )
+                            }
+                          />
+                        ) : (
+                          <Ionicons
+                            name={
+                              isVideo
+                                ? "videocam"
+                                : isAudio
+                                  ? "musical-notes"
+                                  : "document-text"
+                            }
+                            size={30}
+                            color={
+                              isVideo
+                                ? "#7850CB"
+                                : isAudio
+                                  ? "#D92B70"
+                                  : "#16866A"
+                            }
+                          />
+                        )}
+                        <Text
+                          numberOfLines={2}
+                          style={themeStyle(uiStyles.previewLabel)}
+                        >
+                          {attachment.name === `Attachment ${index + 1}`
+                            ? isImage
+                              ? "Saved image"
+                              : isVideo
+                                ? "Saved video"
+                                : isAudio
+                                  ? "Saved audio"
+                                  : "Saved file"
+                            : attachment.name}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                  {imageUris.map((uri, index) => (
+                    <View
+                      key={`new-image-${uri}-${index}`}
+                      style={themeStyle(uiStyles.attachmentPreview)}
+                    >
+                      <Image
+                        source={{ uri }}
+                        style={themeStyle(uiStyles.previewImage)}
+                        resizeMode="cover"
+                      />
+                      <Text
+                        numberOfLines={1}
+                        style={themeStyle(uiStyles.previewLabel)}
+                      >
+                        Image {index + 1}
+                      </Text>
+                      <Pressable
+                        style={themeStyle(uiStyles.removeAttachment)}
+                        onPress={() => {
+                          if (
+                            Platform.OS === "web" &&
+                            uri.startsWith("blob:")
+                          ) {
+                            URL.revokeObjectURL(uri);
+                          }
+                          setImageUris((previous) =>
+                            previous.filter((item) => item !== uri),
+                          );
+                          setWebImageFiles((previous) =>
+                            previous.filter((item) => item.uri !== uri),
+                          );
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Remove image ${index + 1}`}
+                      >
+                        <Ionicons name="close" size={17} color="#243B43" />
+                      </Pressable>
+                    </View>
+                  ))}
+
+                  {videoUris.map((uri, index) => (
+                    <View
+                      key={`new-video-${uri}-${index}`}
+                      style={[
+                        themeStyle(uiStyles.attachmentPreview),
+                        themeStyle(uiStyles.filePreview),
+                        { backgroundColor: "#F0EAFE" },
+                      ]}
+                    >
+                      <Ionicons name="play-circle" size={35} color="#7850CB" />
+                      <Text
+                        numberOfLines={2}
+                        style={themeStyle(uiStyles.previewLabel)}
+                      >
+                        Video {index + 1}
+                      </Text>
+                      <Pressable
+                        style={themeStyle(uiStyles.removeAttachment)}
+                        onPress={() => {
+                          if (
+                            Platform.OS === "web" &&
+                            uri.startsWith("blob:")
+                          ) {
+                            URL.revokeObjectURL(uri);
+                          }
+                          setVideoUris((previous) =>
+                            previous.filter((item) => item !== uri),
+                          );
+                          setWebVideoFiles((previous) =>
+                            previous.filter((item) => item.uri !== uri),
+                          );
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Remove video ${index + 1}`}
+                      >
+                        <Ionicons name="close" size={17} color="#243B43" />
+                      </Pressable>
+                    </View>
+                  ))}
+
+                  {attachedFiles.map((file, index) => (
+                    <Pressable
+                      key={`new-document-${file.uri}-${index}`}
+                      style={[
+                        themeStyle(uiStyles.attachmentPreview),
+                        themeStyle(uiStyles.filePreview),
+                        { backgroundColor: "#FFF0E5" },
+                      ]}
+                      onPress={() => {
+                        void Linking.openURL(file.uri).catch(() => {
+                          showAlert(
+                            "Unable to open file",
+                            `Could not open ${file.name}.`,
+                          );
+                        });
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Open ${file.name}`}
+                    >
+                      <Ionicons
+                        name="document-text"
+                        size={30}
+                        color="#F57917"
+                      />
+                      <Text
+                        numberOfLines={2}
+                        style={themeStyle(uiStyles.previewLabel)}
+                      >
+                        {file.name || `Document ${index + 1}`}
+                      </Text>
+                      <Pressable
+                        style={themeStyle(uiStyles.removeAttachment)}
+                        onPress={() =>
+                          setAttachedFiles((previous) =>
+                            previous.filter((item) => item.uri !== file.uri),
+                          )
+                        }
+                        accessibilityRole="button"
+                        accessibilityLabel={`Remove ${file.name}`}
+                      >
+                        <Ionicons name="close" size={17} color="#243B43" />
+                      </Pressable>
+                    </Pressable>
+                  ))}
+                  {voiceUri ? (
+                    <View
+                      style={[
+                        themeStyle(uiStyles.attachmentPreview),
+                        themeStyle(uiStyles.filePreview),
+                        { backgroundColor: "#FDE9F2" },
+                      ]}
+                    >
+                      <Pressable
+                        onPress={() => {
+                          void togglePlayback();
+                        }}
+                        hitSlop={10}
+                        accessibilityRole="button"
+                        accessibilityLabel={
+                          playerStatus.playing
+                            ? "Pause voice note"
+                            : "Play voice note"
+                        }
+                      >
+                        <Ionicons
+                          name={
+                            playerStatus.playing
+                              ? "pause-circle"
+                              : "play-circle"
+                          }
+                          size={32}
+                          color="#D92B70"
+                        />
+                      </Pressable>
+
+                      <Text style={themeStyle(uiStyles.previewLabel)}>
+                        {playerStatus.playing
+                          ? "Playing voice note"
+                          : "Voice note"}
+                      </Text>
+
+                      <Pressable
+                        style={themeStyle(uiStyles.removeAttachment)}
+                        onPress={() => setVoiceUri(null)}
+                        hitSlop={8}
+                      >
+                        <Ionicons name="close" size={17} color="#243B43" />
+                      </Pressable>
+                    </View>
+                  ) : null}
+                  {drawingUri ? (
+                    <View style={themeStyle(uiStyles.attachmentPreview)}>
+                      <Image
+                        source={{ uri: drawingUri }}
+                        style={themeStyle(uiStyles.previewImage)}
+                      />
+                      <Pressable
+                        style={themeStyle(uiStyles.removeAttachment)}
+                        onPress={() => setDrawingUri(null)}
+                      >
+                        <Ionicons name="close" size={17} color="#243B43" />
+                      </Pressable>
+                    </View>
+                  ) : null}
+                  <Pressable
+                    style={[
+                      themeStyle(uiStyles.attachmentPreview),
+                      themeStyle(uiStyles.addMore),
+                    ]}
+                    onPress={() => void pickImage()}
+                  >
+                    <Ionicons name="add" size={34} color="#64748B" />
+                    <Text style={themeStyle(uiStyles.previewLabel)}>
+                      Add More
+                    </Text>
+                  </Pressable>
+                </View>
+              ) : null}
+
+              <View style={themeStyle(uiStyles.settingsGrid)}>
+                {/* Due Date & Time */}
+                <SettingTile
+                  icon="calendar-outline"
+                  title="Due Date & Time"
+                  subtitle={`${formattedDate || "Choose date"} · ${dueDateTime.toLocaleTimeString(
+                    [],
+                    { hour: "2-digit", minute: "2-digit" },
+                  )}`}
+                  tint="#18A98B"
+                  bg="#E9F9F3"
+                  onPress={openDatePicker}
+                />
+
+                {/* Note Theme */}
+                <SettingTile
+                  icon="color-palette-outline"
+                  title="Note Theme"
+                  subtitle={`${
+                    (
+                      {
+                        "#FFF4CC": "Warm",
+                        "#DDF7E8": "Fresh",
+                        "#DDEBFF": "Ocean",
+                        "#FCE1EE": "Blush",
+                        "#EDE2FF": "Lavender",
+                        "#FFFFFF": "Classic",
+                      } as Record<string, string>
+                    )[quickNoteColor] || "Custom"
+                  } · ${
+                    notePattern.charAt(0).toUpperCase() + notePattern.slice(1)
+                  }`}
+                  tint="#1686E8"
+                  bg="#E8F4FF"
+                  onPress={openNoteThemePicker}
+                />
+
+                {/* Template */}
+                <SettingTile
+                  icon="albums-outline"
+                  title="Template"
+                  subtitle="Daily plan, checklist or journal"
+                  tint="#0D8B78"
+                  bg="#E5F8F2"
+                  onPress={openNoteTemplatePicker}
+                />
+              </View>
+
+              {/* Reminder + Repeat in one card */}
+              <View
+                style={[
+                  uiStyles.reminderCard,
+                  {
+                    backgroundColor: appTheme.surface,
+                    borderColor: appTheme.border,
+                  },
+                ]}
+              >
+                <Pressable
+                  onPress={openReminderPicker}
+                  accessibilityRole="button"
+                  accessibilityLabel="Set reminder date and time"
+                  style={uiStyles.reminderHeader}
+                >
+                  <View
+                    style={[
+                      uiStyles.reminderIcon,
+                      { backgroundColor: "#FFF1E5" },
+                    ]}
+                  >
+                    <Ionicons
+                      name="notifications-outline"
+                      size={21}
+                      color="#E87924"
+                    />
+                  </View>
+
+                  <View style={{ flex: 1 }}>
+                    <Text
+                      style={[
+                        uiStyles.reminderTitle,
+                        { color: mintTheme.text },
+                      ]}
+                    >
+                      Reminder
+                    </Text>
+
+                    <Text
+                      style={[
+                        uiStyles.reminderSubtitle,
+                        { color: mintTheme.subtitle },
+                      ]}
+                    >
+                      {alarmDate
+                        ? toAlarmLabel(alarmDate)
+                        : new Date().toLocaleString([], {
+                            dateStyle: "medium",
+                            timeStyle: "short",
+                          })}
+                    </Text>
+                  </View>
+
+                  <Ionicons
+                    name="chevron-forward"
+                    size={18}
+                    color={appTheme.secondaryText}
+                  />
+                </Pressable>
+
+                <View
+                  style={[
+                    uiStyles.reminderDivider,
+                    { backgroundColor: appTheme.border },
+                  ]}
+                />
+
+                <View style={uiStyles.repeatHeader}>
+                  <Ionicons name="repeat-outline" size={18} color="#E87924" />
+
+                  <Text
+                    style={[uiStyles.repeatTitle, { color: mintTheme.text }]}
                   >
                     Repeat reminder
                   </Text>
+
+                  <View style={{ flex: 1 }} />
+
                   <Text
                     style={[
-                      uiStyles.recurringSubtitle,
-                      { color: appTheme.secondaryText },
+                      uiStyles.repeatCurrent,
+                      { color: personalAccentColor },
                     ]}
                   >
-                    {alarmDate
-                      ? "Choose how often to remind you"
-                      : "Set a reminder first to enable repeating"}
+                    {
+                      {
+                        none: "Never",
+                        daily: "Daily",
+                        weekly: "Weekly",
+                        monthly: "Monthly",
+                      }[recurring]
+                    }
                   </Text>
                 </View>
-              </View>
-              <View style={uiStyles.recurringOptions}>
-                {(
-                  [
-                    { label: "No repeat", value: "none" },
-                    { label: "Daily", value: "daily" },
-                    { label: "Weekly", value: "weekly" },
-                    { label: "Monthly", value: "monthly" },
-                  ] as const
-                ).map((option) => {
-                  const selected = recurring === option.value;
-                  return (
-                    <Pressable
-                      key={option.value}
-                      accessibilityRole="button"
-                      accessibilityState={{
-                        selected,
-                        disabled: !alarmDate && option.value !== "none",
-                      }}
-                      disabled={!alarmDate && option.value !== "none"}
-                      onPress={() => setRecurring(option.value)}
-                      style={[
-                        uiStyles.recurringOption,
-                        {
-                          borderColor: selected
-                            ? personalAccentColor
-                            : appTheme.border,
-                          backgroundColor: selected
-                            ? `${personalAccentColor}18`
-                            : appTheme.background,
-                        },
-                        !alarmDate &&
-                          option.value !== "none" && { opacity: 0.45 },
-                      ]}
-                    >
-                      <Text
+
+                <View style={uiStyles.recurringOptions}>
+                  {(
+                    [
+                      { label: "Never", value: "none" },
+                      { label: "Daily", value: "daily" },
+                      { label: "Weekly", value: "weekly" },
+                      { label: "Monthly", value: "monthly" },
+                    ] as const
+                  ).map((option) => {
+                    const selected = recurring === option.value;
+                    const disabled = !alarmDate && option.value !== "none";
+
+                    return (
+                      <Pressable
+                        key={option.value}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected, disabled }}
+                        disabled={disabled}
+                        onPress={() => setRecurring(option.value)}
                         style={[
-                          uiStyles.recurringOptionText,
+                          uiStyles.recurringOption,
                           {
-                            color: selected
+                            borderColor: selected
                               ? personalAccentColor
-                              : appTheme.text,
-                            fontWeight: selected ? "700" : "500",
+                              : appTheme.border,
+                            backgroundColor: selected
+                              ? `${personalAccentColor}18`
+                              : appTheme.background,
                           },
+                          disabled && { opacity: 0.45 },
                         ]}
                       >
-                        {option.label}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              {!alarmDate && recurring !== "none" ? (
-                <Text style={uiStyles.recurringWarning}>
-                  Choose a reminder date and time before enabling repeat.
-                </Text>
-              ) : null}
-            </View>
-            <View style={themeStyle(uiStyles.noteColorTile)}>
-              <View style={themeStyle(uiStyles.noteColorIcon)}>
-                <Ionicons
-                  name="color-palette-outline"
-                  size={26}
-                  color="#1686E8"
-                />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={themeStyle(uiStyles.settingTitle)}>
-                  Note Color
-                </Text>
-                <View style={themeStyle(uiStyles.colorDots)}>
-                  {quickNoteColors.map((color) => (
-                    <Pressable
-                      key={color}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Choose note color ${color}`}
-                      accessibilityState={{
-                        selected: quickNoteColor === color,
-                      }}
-                      onPress={() => setQuickNoteColor(color)}
-                      style={[
-                        themeStyle(uiStyles.colorDot),
-                        { backgroundColor: color },
-                        quickNoteColor === color &&
-                          themeStyle(uiStyles.selectedColorDot),
-                      ]}
-                    />
-                  ))}
+                        {selected && (
+                          <Ionicons
+                            name="checkmark-circle"
+                            size={14}
+                            color={personalAccentColor}
+                          />
+                        )}
+
+                        <Text
+                          style={[
+                            uiStyles.recurringOptionText,
+                            {
+                              color: selected
+                                ? personalAccentColor
+                                : appTheme.text,
+                              fontWeight: selected ? "700" : "500",
+                            },
+                          ]}
+                        >
+                          {option.label}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
                 </View>
+
+                {!alarmDate && recurring !== "none" && (
+                  <Text style={uiStyles.recurringWarning}>
+                    Set a reminder date and time to enable repeating.
+                  </Text>
+                )}
               </View>
-              <Ionicons name="chevron-forward" size={21} color="#6394B1" />
+              <Pressable
+                onPress={() => void saveTodo()}
+                disabled={loading || recordingBusy || isRecording}
+                style={themeStyle(uiStyles.saveButton)}
+              >
+                <LinearGradient
+                  colors={["#078E89", "#13B9A0", "#23D5A5"]}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 0 }}
+                  style={[
+                    themeStyle(uiStyles.saveGradient),
+                    {
+                      minHeight: isDesktop
+                        ? 54
+                        : isNarrowPhone
+                          ? 58
+                          : isShortScreen
+                            ? 64
+                            : 72,
+                      borderRadius: isDesktop ? 14 : undefined,
+                      gap: isDesktop ? 10 : isNarrowPhone ? 9 : 13,
+                    },
+                  ]}
+                >
+                  {loading ? (
+                    <ActivityIndicator color="#FFFFFF" />
+                  ) : (
+                    <Ionicons
+                      name="save-outline"
+                      size={isNarrowPhone ? 24 : 30}
+                      color="#FFFFFF"
+                    />
+                  )}
+                  <Text
+                    style={[
+                      themeStyle(uiStyles.saveText),
+                      { fontSize: isDesktop ? 16 : isNarrowPhone ? 16 : 20 },
+                    ]}
+                  >
+                    {loading
+                      ? "Saving Note..."
+                      : isEditing
+                        ? "Update Note"
+                        : "Save Note"}
+                  </Text>
+                </LinearGradient>
+              </Pressable>
+
+              <View style={themeStyle(uiStyles.draftStatusRow)}>
+                <Ionicons
+                  name={
+                    draftStatus === "saved"
+                      ? "checkmark-circle-outline"
+                      : "cloud-upload-outline"
+                  }
+                  size={14}
+                  color={appTheme.secondaryText}
+                />
+                <Text style={themeStyle(uiStyles.draftStatusText)}>
+                  {draftStatus === "saved"
+                    ? "Draft saved on this device"
+                    : "Your changes are saved as a draft"}
+                </Text>
+              </View>
             </View>
-          </View>
-
-          <Pressable
-            onPress={() => void saveTodo()}
-            disabled={loading || recordingBusy || isRecording}
-            style={themeStyle(uiStyles.saveButton)}
-          >
-            <LinearGradient
-              colors={["#078E89", "#13B9A0", "#23D5A5"]}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 0 }}
-              style={themeStyle(uiStyles.saveGradient)}
-            >
-              {loading ? (
-                <ActivityIndicator color="#FFFFFF" />
-              ) : (
-                <Ionicons name="save-outline" size={30} color="#FFFFFF" />
-              )}
-              <Text style={themeStyle(uiStyles.saveText)}>
-                {loading
-                  ? "Saving Note..."
-                  : isEditing
-                    ? "Update Note"
-                    : "Save Note"}
-              </Text>
-            </LinearGradient>
-          </Pressable>
-
-          <View style={themeStyle(uiStyles.draftStatusRow)}>
-            <Ionicons
-              name={
-                draftStatus === "saved"
-                  ? "checkmark-circle-outline"
-                  : "cloud-upload-outline"
-              }
-              size={14}
-              color={appTheme.secondaryText}
-            />
-            <Text style={themeStyle(uiStyles.draftStatusText)}>
-              {draftStatus === "saved"
-                ? "Draft saved on this device"
-                : "Your changes are saved as a draft"}
-            </Text>
           </View>
 
           {/* Attachment options bottom-sheet modal */}
+
           <Modal
             visible={attachmentModalVisible}
             transparent
@@ -4461,8 +6920,16 @@ export default function TodolistScreen() {
                 onPress={() => setAttachmentModalVisible(false)}
                 accessibilityLabel="Close attachment options"
               />
-              <View style={themeStyle(uiStyles.attachmentModalSheet)}>
+
+              <View
+                style={[
+                  themeStyle(uiStyles.attachmentModalSheet),
+                  { maxHeight: "88%", flexShrink: 1 },
+                ]}
+              >
                 <View style={themeStyle(uiStyles.attachmentModalHandle)} />
+
+                {/* Header stays visible */}
                 <View style={themeStyle(uiStyles.attachmentModalHeader)}>
                   <View style={{ flex: 1 }}>
                     <Text style={themeStyle(uiStyles.attachmentModalTitle)}>
@@ -4472,6 +6939,7 @@ export default function TodolistScreen() {
                       Choose what you want to attach
                     </Text>
                   </View>
+
                   <Pressable
                     style={themeStyle(uiStyles.attachmentModalClose)}
                     onPress={() => setAttachmentModalVisible(false)}
@@ -4481,112 +6949,115 @@ export default function TodolistScreen() {
                     <Ionicons name="close" size={21} color="#52645F" />
                   </Pressable>
                 </View>
-                <View style={themeStyle(uiStyles.attachmentModalGrid)}>
-                  <AttachmentTile
-                    label="Add Image"
-                    icon="image-outline"
-                    tint="#07876E"
-                    bg="#E5F8F2"
-                    onPress={() => {
-                      setAttachmentModalVisible(false);
-                      void pickImage();
-                    }}
-                  />
-                  <AttachmentTile
-                    label="Add Video"
-                    icon="videocam-outline"
-                    tint="#8652EB"
-                    bg="#F0EAFE"
-                    onPress={() => {
-                      setAttachmentModalVisible(false);
-                      void pickImage();
-                    }}
-                  />
-                  {/* Voice recording controls remain in this modal while recording. */}
-                  {!recordingSessionActive && !voiceUri && (
+
+                {/* Scrollable attachment options */}
+                <ScrollView
+                  style={{
+                    flex: 1,
+                    minHeight: 0,
+                    width: "100%",
+                  }}
+                  contentContainerStyle={{
+                    flexGrow: 1,
+                    paddingBottom: 20,
+                  }}
+                  showsVerticalScrollIndicator={true}
+                  persistentScrollbar={true}
+                  nestedScrollEnabled
+                  keyboardShouldPersistTaps="handled"
+                >
+                  <View style={uiStyles.attachmentModalGrid}>
                     <AttachmentTile
-                      label="Record Voice"
-                      icon="mic-outline"
-                      tint="#F12870"
-                      bg="#FDE9F2"
+                      label="Add Image"
+                      icon="image-outline"
+                      tint="#07876E"
+                      bg="#E5F8F2"
                       onPress={() => {
-                        void startRecording();
+                        setAttachmentModalVisible(false);
+                        void pickImage();
                       }}
                     />
-                  )}
 
-                  {recordingSessionActive && (
-                    <>
+                    <AttachmentTile
+                      label="Add Video"
+                      icon="videocam-outline"
+                      tint="#8652EB"
+                      bg="#F0EAFE"
+                      onPress={() => {
+                        if (Platform.OS !== "web") {
+                          setAttachmentModalVisible(false);
+                        }
+                        void pickVideo();
+                      }}
+                    />
+
+                    {!recordingSessionActive && !voiceUri && (
+                      <AttachmentTile
+                        label="Record Voice"
+                        icon="mic-outline"
+                        tint="#F12870"
+                        bg="#FDE9F2"
+                        onPress={() => void startRecording()}
+                      />
+                    )}
+
+                    {recordingSessionActive && (
+                      <>
+                        <AttachmentTile
+                          label={
+                            isPaused ? "Resume Recording" : "Pause Recording"
+                          }
+                          icon={
+                            isPaused
+                              ? "play-circle-outline"
+                              : "pause-circle-outline"
+                          }
+                          tint="#0D9488"
+                          bg="#DDF7F0"
+                          onPress={() => {
+                            if (isPaused) void resumeRecording();
+                            else void pauseVoiceRecording();
+                          }}
+                        />
+
+                        <AttachmentTile
+                          label="Stop Recording"
+                          icon="stop-circle-outline"
+                          tint="#D92B70"
+                          bg="#FDE9F2"
+                          onPress={() => void stopRecording()}
+                        />
+                      </>
+                    )}
+
+                    {voiceUri && !recordingSessionActive && (
                       <AttachmentTile
                         label={
-                          isPaused ? "Resume Recording" : "Pause Recording"
+                          playerStatus.playing ? "Pause Audio" : "Play Audio"
                         }
                         icon={
-                          isPaused
-                            ? "play-circle-outline"
-                            : "pause-circle-outline"
+                          playerStatus.playing
+                            ? "pause-circle-outline"
+                            : "play-circle-outline"
                         }
                         tint="#0D9488"
                         bg="#DDF7F0"
-                        onPress={() => {
-                          if (isPaused) void resumeRecording();
-                          else void pauseVoiceRecording();
-                        }}
+                        onPress={() => void togglePlayback()}
                       />
-                      <AttachmentTile
-                        label="Stop Recording"
-                        icon="stop-circle-outline"
-                        tint="#D92B70"
-                        bg="#FDE9F2"
-                        onPress={() => {
-                          void stopRecording();
-                        }}
-                      />
-                    </>
-                  )}
+                    )}
 
-                  {voiceUri && !recordingSessionActive && (
                     <AttachmentTile
-                      label={
-                        playerStatus.playing ? "Pause Audio" : "Play Audio"
-                      }
-                      icon={
-                        playerStatus.playing
-                          ? "pause-circle-outline"
-                          : "play-circle-outline"
-                      }
-                      tint="#0D9488"
-                      bg="#DDF7F0"
+                      label="Add File"
+                      icon="document-text-outline"
+                      tint="#F57917"
+                      bg="#FFF0E5"
                       onPress={() => {
-                        void togglePlayback();
+                        setAttachmentModalVisible(false);
+                        void pickDocument();
                       }}
                     />
-                  )}
-
-                  <AttachmentTile
-                    label="Handwriting"
-                    icon="create-outline"
-                    tint="#187BE8"
-                    bg="#E6F3FF"
-                    onPress={() => {
-                      setAttachmentModalVisible(false);
-                      setDrawingModalVisible(true);
-                    }}
-                  />
-                  <AttachmentTile
-                    label="Add File"
-                    icon="document-text-outline"
-                    tint="#F57917"
-                    bg="#FFF0E5"
-                    onPress={() => {
-                      setAttachmentModalVisible(false);
-                      Alert.alert(
-                        "Add File",
-                        "Image and video attachments are available above. To attach documents, install expo-document-picker in your Expo project.",
-                      );
-                    }}
-                  />
-                </View>
+                  </View>
+                </ScrollView>
               </View>
             </View>
           </Modal>
@@ -4612,7 +7083,7 @@ export default function TodolistScreen() {
                     Text Color
                   </Text>
                   <Pressable onPress={() => setColorPaletteVisible(false)}>
-                    <Ionicons name="close" size={23} color={appTheme.text} />
+                    <Ionicons name="close" size={23} color={mintTheme.text} />
                   </Pressable>
                 </View>
 
@@ -4654,6 +7125,7 @@ export default function TodolistScreen() {
             </Pressable>
           </Modal>
 
+          {/* font family */}
           <Modal
             visible={fontPickerVisible}
             transparent
@@ -4672,44 +7144,61 @@ export default function TodolistScreen() {
                   <Text style={themeStyle(styles.fontModalTitle)}>
                     Choose Font
                   </Text>
-                  <Pressable onPress={() => setFontPickerVisible(false)}>
-                    <Ionicons name="close" size={23} color={appTheme.text} />
+
+                  <Pressable
+                    onPress={() => setFontPickerVisible(false)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Close font picker"
+                  >
+                    <Ionicons name="close" size={23} color={mintTheme.text} />
                   </Pressable>
                 </View>
 
-                {fontFamilies.map((font) => (
-                  <Pressable
-                    key={font}
-                    style={[
-                      themeStyle(styles.fontOption),
-                      fontFamily === font &&
-                        themeStyle(styles.fontOptionActive),
-                    ]}
-                    onPress={() => {
-                      setFontFamily(font as any);
-                      setFontPickerVisible(false);
-                    }}
-                  >
-                    <Text
-                      style={[
-                        themeStyle(styles.fontOptionText),
-                        { fontFamily: font === "System" ? undefined : font },
-                        fontFamily === font &&
-                          themeStyle(styles.fontOptionTextActive),
-                      ]}
-                    >
-                      {font === "System" ? "Default System Font" : font}
-                    </Text>
+                {fontFamilies.map((font) => {
+                  const isSystemFont = font === "System";
+                  const isSelected = isSystemFont
+                    ? !fontFamily || fontFamily === "System"
+                    : fontFamily === font;
 
-                    {fontFamily === font && (
-                      <Ionicons
-                        name="checkmark-circle"
-                        size={20}
-                        color="#239B83"
-                      />
-                    )}
-                  </Pressable>
-                ))}
+                  return (
+                    <Pressable
+                      key={font}
+                      style={[
+                        themeStyle(styles.fontOption),
+                        isSelected && themeStyle(styles.fontOptionActive),
+                      ]}
+                      onPress={() => {
+                        setFontFamily(font === "System" ? undefined : font);
+                        setFontPickerVisible(false);
+                      }}
+                      accessibilityRole="button"
+                      accessibilityLabel={
+                        isSystemFont ? "Default System Font" : font
+                      }
+                      accessibilityState={{ selected: isSelected }}
+                    >
+                      <Text
+                        style={[
+                          themeStyle(styles.fontOptionText),
+                          {
+                            fontFamily: isSystemFont ? undefined : font,
+                          },
+                          isSelected && themeStyle(styles.fontOptionTextActive),
+                        ]}
+                      >
+                        {isSystemFont ? "Default System Font" : font}
+                      </Text>
+
+                      {isSelected && (
+                        <Ionicons
+                          name="checkmark-circle"
+                          size={20}
+                          color="#239B83"
+                        />
+                      )}
+                    </Pressable>
+                  );
+                })}
               </Pressable>
             </Pressable>
           </Modal>
@@ -4736,7 +7225,7 @@ export default function TodolistScreen() {
                     onPress={() => setSpacingModalVisible(false)}
                     accessibilityLabel="Close text spacing"
                   >
-                    <Ionicons name="close" size={23} color={appTheme.text} />
+                    <Ionicons name="close" size={23} color={mintTheme.text} />
                   </Pressable>
                 </View>
 
@@ -4754,7 +7243,7 @@ export default function TodolistScreen() {
                     }
                     accessibilityLabel="Decrease line spacing"
                   >
-                    <Ionicons name="remove" size={20} color={appTheme.text} />
+                    <Ionicons name="remove" size={20} color={mintTheme.text} />
                   </Pressable>
                   <Text style={themeStyle(styles.spacingValue)}>
                     {lineSpacing} px
@@ -4766,7 +7255,7 @@ export default function TodolistScreen() {
                     }
                     accessibilityLabel="Increase line spacing"
                   >
-                    <Ionicons name="add" size={20} color={appTheme.text} />
+                    <Ionicons name="add" size={20} color={mintTheme.text} />
                   </Pressable>
                 </View>
 
@@ -4788,7 +7277,7 @@ export default function TodolistScreen() {
                     }
                     accessibilityLabel="Decrease letter spacing"
                   >
-                    <Ionicons name="remove" size={20} color={appTheme.text} />
+                    <Ionicons name="remove" size={20} color={mintTheme.text} />
                   </Pressable>
                   <Text style={themeStyle(styles.spacingValue)}>
                     {letterSpacing.toFixed(2)} px
@@ -4802,7 +7291,7 @@ export default function TodolistScreen() {
                     }
                     accessibilityLabel="Increase letter spacing"
                   >
-                    <Ionicons name="add" size={20} color={appTheme.text} />
+                    <Ionicons name="add" size={20} color={mintTheme.text} />
                   </Pressable>
                 </View>
 
@@ -4829,328 +7318,7 @@ export default function TodolistScreen() {
             </Pressable>
           </Modal>
 
-          <Modal
-            visible={drawingModalVisible}
-            animationType="slide"
-            presentationStyle="fullScreen"
-            onRequestClose={() => setDrawingModalVisible(false)}
-          >
-            <SafeAreaView
-              style={[themeStyle(styles.drawingScreen), { flex: 1 }]}
-            >
-              {/* Header */}
-              <View style={themeStyle(styles.drawingHeader)}>
-                <Pressable
-                  style={themeStyle(styles.drawingHeaderButton)}
-                  onPress={() => setDrawingModalVisible(false)}
-                  accessibilityLabel="Close drawing"
-                >
-                  <Ionicons name="close" size={24} color={appTheme.text} />
-                </Pressable>
-
-                <View
-                  style={[themeStyle(styles.drawingHeaderText), { flex: 1 }]}
-                >
-                  <Text style={themeStyle(styles.drawingTitle)}>
-                    Handwriting & Drawing
-                  </Text>
-                  <Text style={themeStyle(styles.drawingSubtitle)}>
-                    Draw, write, and convert handwriting to text
-                  </Text>
-                </View>
-
-                <Pressable
-                  style={themeStyle(styles.drawingSaveButton)}
-                  onPress={() => void saveDrawing()}
-                  accessibilityLabel="Save drawing"
-                >
-                  <Ionicons name="checkmark" size={18} color="#FFFFFF" />
-                  <Text style={themeStyle(styles.drawingSaveButtonText)}>
-                    Save
-                  </Text>
-                </Pressable>
-              </View>
-
-              {/* Drawing toolbar */}
-              <View style={themeStyle(styles.drawingToolbar)}>
-                <Pressable
-                  style={themeStyle(styles.drawingToolButton)}
-                  onPress={undoDrawing}
-                  accessibilityLabel="Undo"
-                >
-                  <Ionicons
-                    name="arrow-undo-outline"
-                    size={20}
-                    color={appTheme.text}
-                  />
-                </Pressable>
-
-                <Pressable
-                  style={themeStyle(styles.drawingToolButton)}
-                  onPress={redoDrawing}
-                  accessibilityLabel="Redo"
-                >
-                  <Ionicons
-                    name="arrow-redo-outline"
-                    size={20}
-                    color={appTheme.text}
-                  />
-                </Pressable>
-
-                <Pressable
-                  style={[
-                    themeStyle(styles.drawingToolButton),
-                    drawingTool === "pen" &&
-                      !drawingEraser &&
-                      themeStyle(styles.drawingToolButtonActive),
-                  ]}
-                  onPress={() => {
-                    setDrawingTool("pen");
-                    setDrawingEraser(false);
-                  }}
-                  accessibilityLabel="Pen tool"
-                >
-                  <Ionicons
-                    name="create-outline"
-                    size={20}
-                    color={appTheme.text}
-                  />
-                </Pressable>
-
-                <Pressable
-                  style={[
-                    themeStyle(styles.drawingToolButton),
-                    drawingTool === "pencil" &&
-                      !drawingEraser &&
-                      themeStyle(styles.drawingToolButtonActive),
-                  ]}
-                  onPress={() => {
-                    setDrawingTool("pencil");
-                    setDrawingEraser(false);
-                  }}
-                  accessibilityLabel="Pencil tool"
-                >
-                  <Ionicons
-                    name="pencil-outline"
-                    size={20}
-                    color={appTheme.text}
-                  />
-                </Pressable>
-
-                <Pressable
-                  style={[
-                    themeStyle(styles.drawingToolButton),
-                    drawingEraser && themeStyle(styles.drawingToolButtonActive),
-                  ]}
-                  onPress={() => setDrawingEraser((value) => !value)}
-                  accessibilityLabel="Eraser"
-                >
-                  <Ionicons
-                    name="backspace-outline"
-                    size={20}
-                    color={appTheme.text}
-                  />
-                </Pressable>
-
-                <Pressable
-                  style={themeStyle(styles.drawingToolButton)}
-                  onPress={clearDrawingCanvas}
-                  accessibilityLabel="Clear canvas"
-                >
-                  <Ionicons name="trash-outline" size={20} color="#DC2626" />
-                </Pressable>
-              </View>
-
-              {/* Brush sizes */}
-              <View style={themeStyle(styles.drawingBrushControl)}>
-                <Text style={themeStyle(styles.drawingBrushLabel)}>
-                  Brush size
-                </Text>
-
-                {[2, 4, 7, 11].map((size) => (
-                  <Pressable
-                    key={size}
-                    style={[
-                      themeStyle(styles.brushSizeOption),
-                      drawingBrushSize === size &&
-                        themeStyle(styles.brushSizeOptionActive),
-                    ]}
-                    onPress={() => {
-                      setDrawingBrushSize(size);
-                      setDrawingEraser(false);
-                    }}
-                    accessibilityLabel={`Brush size ${size}`}
-                  >
-                    <View
-                      style={[
-                        themeStyle(styles.brushDot),
-                        { width: size + 3, height: size + 3 },
-                      ]}
-                    />
-                  </Pressable>
-                ))}
-              </View>
-
-              {/* Drawing colors */}
-              <View style={themeStyle(styles.drawingColorRow)}>
-                {[
-                  "#172F2B",
-                  "#DC2626",
-                  "#239B83",
-                  "#16A34A",
-                  "#9333EA",
-                  "#EA580C",
-                  "#DB2777",
-                  "#0891B2",
-                  "#FFFFFF",
-                ].map((color) => (
-                  <Pressable
-                    key={color}
-                    onPress={() => {
-                      setDrawingColor(color);
-                      setDrawingEraser(false);
-                    }}
-                    style={[
-                      themeStyle(styles.drawingColorSwatch),
-                      { backgroundColor: color },
-                      drawingColor === color &&
-                        !drawingEraser &&
-                        themeStyle(styles.drawingColorSwatchSelected),
-                    ]}
-                    accessibilityLabel={`Select color ${color}`}
-                  >
-                    {drawingColor === color && !drawingEraser && (
-                      <Ionicons
-                        name="checkmark"
-                        size={15}
-                        color={color === "#FFFFFF" ? appTheme.text : "#FFFFFF"}
-                      />
-                    )}
-                  </Pressable>
-                ))}
-              </View>
-
-              {/* Convert handwriting to text */}
-              <View style={themeStyle(styles.handwritingRecognitionBar)}>
-                <Pressable
-                  style={[
-                    themeStyle(styles.handwritingConvertButton),
-                    {
-                      opacity:
-                        drawingRecognitionBusy ||
-                        (drawingStrokes.length === 0 && !currentDrawingStroke)
-                          ? 0.55
-                          : 1,
-                    },
-                  ]}
-                  disabled={
-                    drawingRecognitionBusy ||
-                    (drawingStrokes.length === 0 && !currentDrawingStroke)
-                  }
-                  onPress={() => {
-                    void recognizeHandwriting(undefined, "en-US", false);
-                  }}
-                >
-                  {drawingRecognitionBusy ? (
-                    <ActivityIndicator size="small" color="#FFFFFF" />
-                  ) : (
-                    <Ionicons name="text-outline" size={16} color="#FFFFFF" />
-                  )}
-
-                  <Text style={themeStyle(styles.handwritingConvertButtonText)}>
-                    {drawingRecognitionBusy
-                      ? "Converting..."
-                      : "Convert to text"}
-                  </Text>
-                </Pressable>
-              </View>
-
-              {!!drawingRecognitionStatus && (
-                <Text style={themeStyle(styles.handwritingRecognitionStatus)}>
-                  {drawingRecognitionStatus}
-                </Text>
-              )}
-
-              {/* Editable recognized text */}
-              <TextInput
-                value={drawingText}
-                onChangeText={setDrawingText}
-                placeholder="Write or correct your recognized text..."
-                placeholderTextColor="#8792A7"
-                multiline
-                textAlignVertical="top"
-                style={themeStyle(styles.handwritingTextInput)}
-              />
-
-              {/* Drawing canvas */}
-              <View
-                style={[
-                  themeStyle(styles.drawingCanvasOuter),
-                  { flex: 1, minHeight: 220 },
-                ]}
-              >
-                <View
-                  ref={drawingCanvasCaptureRef}
-                  collapsable={false}
-                  style={[
-                    themeStyle(styles.drawingCanvas),
-                    { flex: 1, minHeight: 220 },
-                  ]}
-                  onLayout={(event) => {
-                    const { width, height } = event.nativeEvent.layout;
-
-                    setDrawingCanvasSize((previous) =>
-                      previous.width === width && previous.height === height
-                        ? previous
-                        : { width, height },
-                    );
-                  }}
-                  onStartShouldSetResponder={() => true}
-                  onMoveShouldSetResponder={() => true}
-                  onResponderTerminationRequest={() => false}
-                  onResponderGrant={(event) => {
-                    beginDrawingStroke(
-                      event.nativeEvent.locationX,
-                      event.nativeEvent.locationY,
-                    );
-                  }}
-                  onResponderMove={(event) => {
-                    moveDrawingStroke(
-                      event.nativeEvent.locationX,
-                      event.nativeEvent.locationY,
-                    );
-                  }}
-                  onResponderRelease={finishDrawingStroke}
-                  onResponderTerminate={finishDrawingStroke}
-                >
-                  <Svg
-                    pointerEvents="none"
-                    width="100%"
-                    height="100%"
-                    viewBox={`0 0 ${Math.max(drawingCanvasSize.width, 1)} ${Math.max(
-                      drawingCanvasSize.height,
-                      1,
-                    )}`}
-                  >
-                    {[
-                      ...drawingStrokes,
-                      ...(currentDrawingStroke ? [currentDrawingStroke] : []),
-                    ].map((stroke, index) => (
-                      <Path
-                        key={`stroke-${index}`}
-                        d={drawingPath(stroke)}
-                        stroke={stroke.color}
-                        strokeWidth={stroke.width}
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        fill="none"
-                      />
-                    ))}
-                  </Svg>
-                </View>
-              </View>
-            </SafeAreaView>
-          </Modal>
+          {/* linkmodal */}
 
           <Modal
             visible={linkModalVisible}
@@ -5200,119 +7368,759 @@ export default function TodolistScreen() {
             </Pressable>
           </Modal>
 
+          {/* note theeme */}
+
           <Modal
             visible={noteThemePickerVisible}
             transparent
             animationType="slide"
+            statusBarTranslucent
             onRequestClose={() => setNoteThemePickerVisible(false)}
           >
-            <View style={themeStyle(uiStyles.themeModalOverlay)}>
-              <View style={themeStyle(uiStyles.themeModalCard)}>
-                <View style={themeStyle(uiStyles.themeModalHeader)}>
+            <View
+              style={[
+                themeStyle(uiStyles.themeModalOverlay),
+                {
+                  justifyContent: "flex-end",
+                  padding: 0,
+                },
+              ]}
+            >
+              <View
+                style={[
+                  themeStyle(uiStyles.themeModalCard),
+                  {
+                    width: "100%",
+                    height: "88%",
+                    borderTopLeftRadius: 26,
+                    borderTopRightRadius: 26,
+                    borderBottomLeftRadius: 0,
+                    borderBottomRightRadius: 0,
+                    paddingHorizontal: 18,
+                    paddingTop: 20,
+                    paddingBottom: 12,
+                  },
+                ]}
+              >
+                {/* HEADER */}
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    marginBottom: 20,
+                  }}
+                >
                   <View>
-                    <Text style={themeStyle(uiStyles.themeModalTitle)}>
-                      Note themes
+                    <Text
+                      style={[
+                        themeStyle(uiStyles.themeModalTitle),
+                        { fontSize: 22, fontWeight: "800" },
+                      ]}
+                    >
+                      Customize your note
                     </Text>
-                    <Text style={themeStyle(uiStyles.themeModalSubtitle)}>
-                      Choose your favorite paper style
+
+                    <Text
+                      style={[
+                        themeStyle(uiStyles.themeModalSubtitle),
+                        { marginTop: 5 },
+                      ]}
+                    >
+                      Choose a color or create your own paper style
                     </Text>
                   </View>
 
                   <Pressable
                     onPress={() => setNoteThemePickerVisible(false)}
-                    style={themeStyle(uiStyles.themeCloseButton)}
+                    style={{
+                      width: 38,
+                      height: 38,
+                      borderRadius: 20,
+                      backgroundColor: "#F1F5F9",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
                   >
-                    <Ionicons name="close" size={23} color="#334155" />
+                    <Ionicons name="close" size={22} color="#334155" />
                   </Pressable>
                 </View>
 
                 <ScrollView
+                  style={{ flex: 1 }}
                   showsVerticalScrollIndicator={false}
-                  contentContainerStyle={themeStyle(uiStyles.themeGrid)}
+                  contentContainerStyle={{ paddingBottom: 28 }}
                 >
-                  {noteThemes.map((theme) => {
-                    const selected =
-                      quickNoteColor === theme.color &&
-                      notePattern === theme.pattern;
+                  {/* SOLID COLORS */}
+                  <View style={{ marginBottom: 25 }}>
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        marginBottom: 5,
+                      }}
+                    >
+                      <Text
+                        style={[
+                          themeStyle(uiStyles.noteColorTitle),
+                          { fontSize: 17, fontWeight: "800" },
+                        ]}
+                      >
+                        Solid Colors
+                      </Text>
+
+                      <Text style={{ fontSize: 11, color: "#94A3B8" }}>
+                        Plain background
+                      </Text>
+                    </View>
+
+                    <Text
+                      style={[
+                        themeStyle(uiStyles.themeModalSubtitle),
+                        { marginBottom: 14 },
+                      ]}
+                    >
+                      Simple colors without patterns
+                    </Text>
+
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        flexWrap: "wrap",
+                        gap: 13,
+                      }}
+                    >
+                      {[
+                        "#FFFFFF",
+                        "#FFF4CC",
+                        "#FFE4E6",
+                        "#FCE7F3",
+                        "#EDE9FE",
+                        "#DBEAFE",
+                        "#D1FAE5",
+                        "#A7E8CC",
+                        "#FEF3C7",
+                        "#F3F4F6",
+                        "#E5E7EB",
+                        "#D6D3D1",
+                        "#FDE2C5",
+                        "#D9F0F0",
+                        "#E8EAFD",
+                        "#F5E6CA",
+                      ].map((color) => {
+                        const selected =
+                          quickNoteColor.toLowerCase() ===
+                            color.toLowerCase() &&
+                          notePattern === "plain" &&
+                          !noteBackgroundImageUri;
+
+                        return (
+                          <Pressable
+                            key={color}
+                            onPress={() => {
+                              setQuickNoteColor(color);
+                              setNoteBackgroundImageUri(null);
+                              setNotePattern("plain");
+                              setNoteThemePickerVisible(false);
+                            }}
+                            style={{
+                              width: 43,
+                              height: 43,
+                              borderRadius: 15,
+                              backgroundColor: color,
+                              borderWidth: selected ? 2.5 : 1,
+                              borderColor: selected
+                                ? personalAccentColor
+                                : "#E2E8F0",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              elevation: selected ? 2 : 0,
+                            }}
+                          >
+                            {selected && (
+                              <Ionicons
+                                name="checkmark"
+                                size={21}
+                                color="#334155"
+                              />
+                            )}
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                  </View>
+
+                  {/* DIVIDER */}
+                  <View
+                    style={{
+                      height: 1,
+                      backgroundColor: "#E9EEF2",
+                      marginBottom: 22,
+                    }}
+                  />
+
+                  {/* PAPER PATTERNS */}
+                  <View style={{ marginBottom: 18 }}>
+                    <Text
+                      style={[
+                        themeStyle(uiStyles.noteColorTitle),
+                        { fontSize: 17, fontWeight: "800" },
+                      ]}
+                    >
+                      Paper Patterns
+                    </Text>
+
+                    <Text
+                      style={[
+                        themeStyle(uiStyles.themeModalSubtitle),
+                        { marginTop: 5, marginBottom: 15 },
+                      ]}
+                    >
+                      First select a pattern, then choose its color
+                    </Text>
+
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        flexWrap: "wrap",
+                        gap: 12,
+                      }}
+                    >
+                      {[
+                        { label: "Lined", value: "lined" },
+                        { label: "Dotted", value: "dotted" },
+                        { label: "Grid", value: "grid" },
+                        { label: "Hearts", value: "heart" },
+                        { label: "Stars", value: "star" },
+                        { label: "Leaves", value: "leaf" },
+                        { label: "Flowers", value: "flower" },
+                        { label: "Checker", value: "checker" },
+                      ].map((item) => {
+                        const selected = pendingNotePattern === item.value;
+
+                        return (
+                          <Pressable
+                            key={item.value}
+                            onPress={() => setPendingNotePattern(item.value)}
+                            style={{
+                              width: "23%",
+                              minWidth: 68,
+                              flexGrow: 1,
+                              padding: 6,
+                              borderRadius: 15,
+                              borderWidth: selected ? 2 : 1,
+                              borderColor: selected
+                                ? personalAccentColor
+                                : "#E2E8F0",
+                              backgroundColor: selected ? "#F0FAF6" : "#FFFFFF",
+                            }}
+                          >
+                            {/* SIMPLE PATTERN PREVIEW */}
+                            <View
+                              style={{
+                                height: 66,
+                                borderRadius: 10,
+                                backgroundColor: "#F8FAFC",
+                                overflow: "hidden",
+                                position: "relative",
+                                justifyContent: "center",
+                              }}
+                            >
+                              <NotePattern
+                                pattern={item.value}
+                                ink="rgba(71, 105, 91, 0.28)"
+                              />
+
+                              {selected && (
+                                <View
+                                  style={{
+                                    position: "absolute",
+                                    top: 5,
+                                    right: 5,
+                                    width: 19,
+                                    height: 19,
+                                    borderRadius: 10,
+                                    backgroundColor: personalAccentColor,
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    zIndex: 5,
+                                  }}
+                                >
+                                  <Ionicons
+                                    name="checkmark"
+                                    size={13}
+                                    color="#FFFFFF"
+                                  />
+                                </View>
+                              )}
+                            </View>
+
+                            <Text
+                              numberOfLines={1}
+                              style={{
+                                fontSize: 12,
+                                fontWeight: selected ? "800" : "600",
+                                color: selected ? "#166B50" : "#475569",
+                                textAlign: "center",
+                                marginTop: 8,
+                                marginBottom: 3,
+                              }}
+                            >
+                              {item.label}
+                            </Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                  </View>
+
+                  {/* PATTERN COLOR */}
+                  <View
+                    style={{
+                      backgroundColor: "#F8FAFC",
+                      borderRadius: 17,
+                      padding: 15,
+                      marginTop: 5,
+                    }}
+                  >
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        marginBottom: 5,
+                      }}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 15,
+                          fontWeight: "800",
+                          color: "#263746",
+                        }}
+                      >
+                        Choose Pattern Color
+                      </Text>
+
+                      <Text
+                        style={{
+                          fontSize: 11,
+                          color: "#64748B",
+                        }}
+                      >
+                        {pendingNotePattern.charAt(0).toUpperCase() +
+                          pendingNotePattern.slice(1)}
+                      </Text>
+                    </View>
+
+                    <Text
+                      style={{
+                        fontSize: 12,
+                        color: "#94A3B8",
+                        marginBottom: 14,
+                      }}
+                    >
+                      Select a background color for your pattern
+                    </Text>
+
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        flexWrap: "wrap",
+                        gap: 12,
+                      }}
+                    >
+                      {[
+                        "#FFFFFF",
+                        "#FFF4CC",
+                        "#FFE4E6",
+                        "#FCE7F3",
+                        "#EDE9FE",
+                        "#DBEAFE",
+                        "#D1FAE5",
+                        "#A7E8CC",
+                        "#FEF3C7",
+                        "#DDF7E8",
+                        "#E3F4FF",
+                        "#FFE5D4",
+                        "#F5E6CA",
+                        "#DCEBDD",
+                        "#E4E7FF",
+                        "#25283D",
+                      ].map((color) => {
+                        const selected =
+                          quickNoteColor.toLowerCase() ===
+                            color.toLowerCase() &&
+                          notePattern === pendingNotePattern &&
+                          !noteBackgroundImageUri;
+
+                        return (
+                          <Pressable
+                            key={color}
+                            onPress={() => {
+                              setQuickNoteColor(color);
+                              setNoteBackgroundImageUri(null);
+                              setNotePattern(pendingNotePattern);
+                              setNoteThemePickerVisible(false);
+                            }}
+                            style={{
+                              width: 39,
+                              height: 39,
+                              borderRadius: 13,
+                              backgroundColor: color,
+                              borderWidth: selected ? 2.5 : 1,
+                              borderColor: selected
+                                ? personalAccentColor
+                                : "#D8E0E7",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            {selected && (
+                              <Ionicons
+                                name="checkmark"
+                                size={19}
+                                color={
+                                  color === "#25283D" ? "#FFFFFF" : "#334155"
+                                }
+                              />
+                            )}
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                  </View>
+
+                  {/* APPLY BUTTON 
+        <Pressable
+          onPress={() => {
+            setQuickNoteColor("#FFFFFF");
+            setNoteBackgroundImageUri(null);
+            setNotePattern(pendingNotePattern);
+            setNoteThemePickerVisible(false);
+          }}
+          style={{
+            backgroundColor: personalAccentColor,
+            borderRadius: 14,
+            paddingVertical: 14,
+            alignItems: "center",
+            justifyContent: "center",
+            marginTop: 18,
+          }}
+        >
+          <Text
+            style={{
+              color: "#FFFFFF",
+              fontSize: 15,
+              fontWeight: "800",
+            }}
+          >
+            Apply Pattern
+          </Text>
+        </Pressable> */}
+                </ScrollView>
+              </View>
+            </View>
+          </Modal>
+
+          {/* hyperlink */}
+
+          <Modal
+            visible={hyperlinkModalVisible}
+            transparent
+            animationType="fade"
+            statusBarTranslucent
+            onRequestClose={() => setHyperlinkModalVisible(false)}
+          >
+            <View style={styles.hyperlinkOverlay}>
+              <View style={styles.hyperlinkModal}>
+                {/* Header */}
+                <View style={styles.hyperlinkHeader}>
+                  <View style={styles.hyperlinkHeaderLeft}>
+                    <View style={styles.hyperlinkIcon}>
+                      <Ionicons name="link" size={23} color="#208A75" />
+                    </View>
+
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.hyperlinkTitle}>Open Hyperlink</Text>
+                      <Text style={styles.hyperlinkSubtitle}>
+                        Select a link to continue
+                      </Text>
+                    </View>
+                  </View>
+
+                  <Pressable
+                    onPress={() => setHyperlinkModalVisible(false)}
+                    style={styles.hyperlinkClose}
+                  >
+                    <Ionicons name="close" size={21} color="#52645E" />
+                  </Pressable>
+                </View>
+
+                {/* Link Count */}
+                <View style={styles.hyperlinkCount}>
+                  <Ionicons name="globe-outline" size={16} color="#208A75" />
+                  <Text style={styles.hyperlinkCountText}>
+                    {hyperlinkList.length} links found
+                  </Text>
+                </View>
+
+                {/* Hyperlink List */}
+                <ScrollView
+                  style={styles.hyperlinkScroll}
+                  showsVerticalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                >
+                  {hyperlinkList.map((url, index) => {
+                    const isSelected = selectedHyperlink === url;
 
                     return (
                       <Pressable
-                        key={theme.label}
+                        key={`${url}-${index}`}
+                        onPress={() => setSelectedHyperlink(url)}
                         style={[
-                          themeStyle(uiStyles.themeCard),
-                          selected && themeStyle(uiStyles.themeCardSelected),
+                          styles.hyperlinkItem,
+                          isSelected && styles.hyperlinkItemSelected,
                         ]}
-                        onPress={() => {
-                          setQuickNoteColor(theme.color);
-                          setNoteBackgroundImageUri(null);
-                          setNotePattern(theme.pattern);
-                          setNoteThemePickerVisible(false);
-                        }}
                       >
                         <View
                           style={[
-                            themeStyle(uiStyles.themePreview),
-                            { backgroundColor: theme.color },
+                            styles.hyperlinkNumber,
+                            isSelected && styles.hyperlinkNumberSelected,
                           ]}
                         >
-                          {theme.pattern === "lined" && (
-                            <View style={themeStyle(uiStyles.themeLines)}>
-                              {[1, 2, 3, 4].map((line) => (
-                                <View
-                                  key={line}
-                                  style={themeStyle(uiStyles.themeLine)}
-                                />
-                              ))}
-                            </View>
-                          )}
-
-                          {theme.pattern === "grid" && (
-                            <View style={themeStyle(uiStyles.themeGridPattern)}>
-                              {[1, 2, 3, 4, 5, 6].map((line) => (
-                                <View
-                                  key={line}
-                                  style={themeStyle(uiStyles.themeGridLine)}
-                                />
-                              ))}
-                            </View>
-                          )}
-
-                          {theme.pattern === "dotted" && (
-                            <View style={themeStyle(uiStyles.themeDots)}>
-                              {Array.from({ length: 20 }, (_, index) => (
-                                <View
-                                  key={index}
-                                  style={themeStyle(uiStyles.themeDot)}
-                                />
-                              ))}
-                            </View>
-                          )}
-
-                          {selected && (
-                            <View
-                              style={themeStyle(uiStyles.themeSelectedBadge)}
-                            >
-                              <Ionicons
-                                name="checkmark"
-                                size={16}
-                                color="#FFFFFF"
-                              />
-                            </View>
-                          )}
+                          <Text
+                            style={[
+                              styles.hyperlinkNumberText,
+                              isSelected && styles.hyperlinkNumberTextSelected,
+                            ]}
+                          >
+                            {index + 1}
+                          </Text>
                         </View>
 
-                        <Text style={themeStyle(uiStyles.themeCardName)}>
-                          {theme.emoji} {theme.label}
-                        </Text>
+                        <View style={styles.hyperlinkContent}>
+                          <Text style={styles.hyperlinkLabel}>
+                            Hyperlink {index + 1}
+                          </Text>
 
-                        <Text style={themeStyle(uiStyles.themeCardPattern)}>
-                          {theme.pattern.charAt(0).toUpperCase() +
-                            theme.pattern.slice(1)}
-                        </Text>
+                          <Text style={styles.hyperlinkUrl} numberOfLines={2}>
+                            {url}
+                          </Text>
+                        </View>
+
+                        <Ionicons
+                          name={
+                            isSelected ? "checkmark-circle" : "ellipse-outline"
+                          }
+                          size={22}
+                          color={isSelected ? "#208A75" : "#B7C6C0"}
+                        />
                       </Pressable>
                     );
                   })}
                 </ScrollView>
+
+                {/* Footer */}
+                <View style={styles.hyperlinkFooter}>
+                  <Pressable
+                    style={styles.hyperlinkCancelButton}
+                    onPress={() => setHyperlinkModalVisible(false)}
+                  >
+                    <Text style={styles.hyperlinkCancelText}>Cancel</Text>
+                  </Pressable>
+
+                  <Pressable
+                    disabled={!selectedHyperlink}
+                    style={[
+                      styles.hyperlinkOpenButton,
+                      !selectedHyperlink && styles.hyperlinkOpenDisabled,
+                    ]}
+                    onPress={async () => {
+                      if (!selectedHyperlink) return;
+
+                      const url = selectedHyperlink;
+
+                      try {
+                        await Linking.openURL(url);
+                        setHyperlinkModalVisible(false);
+                      } catch {
+                        showAlert("Unable to open link", url);
+                      }
+                    }}
+                  >
+                    <Ionicons name="open-outline" size={18} color="#FFFFFF" />
+                    <Text style={styles.hyperlinkOpenText}>Open Link</Text>
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          </Modal>
+
+          {/* Desktop/Web alert dialog replacing unsupported Alert.alert UI */}
+          <Modal
+            visible={Platform.OS === "web" && appAlert.visible}
+            transparent
+            animationType="fade"
+            statusBarTranslucent
+            onRequestClose={() => {
+              if (appAlert.options?.cancelable) closeAppAlert();
+            }}
+          >
+            <View
+              style={{
+                flex: 1,
+                backgroundColor: "rgba(15, 35, 30, 0.48)",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: 24,
+              }}
+            >
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Alert backdrop"
+                disabled={!appAlert.options?.cancelable}
+                onPress={() => {
+                  if (appAlert.options?.cancelable) closeAppAlert();
+                }}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  right: 0,
+                  bottom: 0,
+                  left: 0,
+                }}
+              />
+
+              <View
+                accessibilityViewIsModal
+                style={{
+                  width: "100%",
+                  maxWidth: 440,
+                  backgroundColor: isDark ? "#1C2B27" : "#FFFFFF",
+                  borderRadius: 22,
+                  padding: 26,
+                  borderWidth: 1,
+                  borderColor: isDark ? "#38544A" : "#D3EDE0",
+                  shadowColor: "#000000",
+                  shadowOffset: { width: 0, height: 12 },
+                  shadowOpacity: 0.2,
+                  shadowRadius: 25,
+                  elevation: 15,
+                }}
+              >
+                <View
+                  style={{
+                    width: 54,
+                    height: 54,
+                    borderRadius: 18,
+                    backgroundColor: isDark ? "#29483D" : "#DDF4E8",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    marginBottom: 18,
+                  }}
+                >
+                  <Ionicons
+                    name={
+                      /error|failed|unable|invalid|required|permission|unavailable/i.test(
+                        appAlert.title,
+                      )
+                        ? "alert-circle-outline"
+                        : /delete|remove/i.test(appAlert.title)
+                          ? "trash-outline"
+                          : /saved|success|copied|cleared|snoozed/i.test(
+                                appAlert.title,
+                              )
+                            ? "checkmark-circle-outline"
+                            : "information-circle-outline"
+                    }
+                    size={30}
+                    color="#16866A"
+                  />
+                </View>
+
+                <Text
+                  style={{
+                    fontSize: 21,
+                    fontWeight: "800",
+                    color: isDark ? "#F0FAF5" : "#183B32",
+                    marginBottom: 10,
+                  }}
+                >
+                  {appAlert.title}
+                </Text>
+
+                {!!appAlert.message && (
+                  <Text
+                    selectable
+                    style={{
+                      fontSize: 14,
+                      lineHeight: 23,
+                      color: isDark ? "#C2D8CE" : "#6B877C",
+                      marginBottom: 26,
+                    }}
+                  >
+                    {appAlert.message}
+                  </Text>
+                )}
+
+                <View
+                  style={{
+                    flexDirection: "row",
+                    justifyContent: "flex-end",
+                    flexWrap: "wrap",
+                    gap: 10,
+                  }}
+                >
+                  {appAlert.buttons.map((button, index) => {
+                    const destructive = button.style === "destructive";
+                    const cancel = button.style === "cancel";
+                    const label = button.text || "OK";
+
+                    return (
+                      <Pressable
+                        key={`${label}-${index}`}
+                        accessibilityRole="button"
+                        accessibilityLabel={label}
+                        onPress={() => {
+                          closeAppAlert();
+                          button.onPress?.();
+                        }}
+                        style={({ pressed }) => ({
+                          minWidth: 105,
+                          minHeight: 42,
+                          paddingHorizontal: 20,
+                          paddingVertical: 12,
+                          borderRadius: 12,
+                          alignItems: "center",
+                          justifyContent: "center",
+                          backgroundColor: destructive
+                            ? "#D94F5C"
+                            : cancel
+                              ? isDark
+                                ? "#30443C"
+                                : "#EDF5F0"
+                              : "#16866A",
+                          opacity: pressed ? 0.82 : 1,
+                        })}
+                      >
+                        <Text
+                          style={{
+                            fontSize: 14,
+                            fontWeight: "700",
+                            color: cancel
+                              ? isDark
+                                ? "#E6F2EC"
+                                : "#36564A"
+                              : "#FFFFFF",
+                          }}
+                        >
+                          {label}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
               </View>
             </View>
           </Modal>
@@ -5412,6 +8220,9 @@ function SettingTile({
   bg: string;
   onPress: () => void;
 }) {
+  const { width: screenWidth } = useWindowDimensions();
+  const narrowLayout = screenWidth < 350;
+
   return (
     <Pressable
       accessibilityRole="button"
@@ -5420,6 +8231,9 @@ function SettingTile({
       style={({ pressed }) => [
         uiStyles.settingTile,
         {
+          width: narrowLayout ? "100%" : "48%",
+          minHeight: narrowLayout ? 96 : 118,
+          padding: narrowLayout ? 11 : 14,
           backgroundColor: "#FFFFFF",
           borderColor: pressed ? `${tint}70` : "#E5EEEC",
         },
@@ -5447,6 +8261,221 @@ function SettingTile({
 }
 
 const uiStyles = StyleSheet.create({
+  header: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: "#EAF8F1",
+
+    // Full border on all four sides
+    borderWidth: 1,
+    borderColor: "#D3EDE0",
+    borderRadius: 22,
+
+    // Keep the header visually elevated without a dark outline
+    shadowColor: "#173F38",
+    shadowOffset: { width: 0, height: 5 },
+    shadowOpacity: 0.045,
+    shadowRadius: 12,
+    elevation: 2,
+  },
+
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    minHeight: 44,
+  },
+
+  backButton: {
+    width: 42,
+    height: 42,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "#DCE9E2",
+  },
+
+  headerCopy: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: "center",
+    paddingVertical: 2,
+  },
+
+  headerTitle: {
+    fontSize: 19,
+    fontWeight: "700",
+    letterSpacing: -0.45,
+    color: "#183B32",
+    lineHeight: 25,
+  },
+
+  headerSubtitle: {
+    fontSize: 12,
+    fontWeight: "500",
+    color: "#6B877C",
+    marginTop: 4,
+    letterSpacing: 0.15,
+    lineHeight: 17,
+  },
+
+  quickSave: {
+    minHeight: 40,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+  },
+
+  quickSaveText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+
+  moreButton: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  headerArt: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 14,
+    paddingTop: 14,
+    paddingBottom: 4,
+  },
+
+  noteColorSection: {
+    width: "100%",
+    marginBottom: 20,
+  },
+
+  noteColorTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#334155",
+    marginBottom: 5,
+  },
+
+  noteColorGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 12,
+    marginTop: 14,
+    marginBottom: 20,
+  },
+
+  noteColorItem: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    borderWidth: 1,
+    borderColor: "#D1D5DB",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  noteColorItemSelected: {
+    borderWidth: 3,
+    borderColor: "#18A98B",
+  },
+
+  noteThemesGrid: {
+    width: "100%",
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    rowGap: 12,
+  },
+
+  reminderCard: {
+    width: "100%",
+    borderWidth: 1,
+    borderRadius: 18,
+    padding: 14,
+    marginVertical: 8,
+  },
+
+  reminderHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    minHeight: 48,
+  },
+
+  reminderIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  reminderTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+  },
+
+  reminderSubtitle: {
+    fontSize: 12,
+    marginTop: 4,
+  },
+
+  reminderDivider: {
+    height: 1,
+    marginVertical: 14,
+  },
+
+  repeatHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    marginBottom: 12,
+  },
+
+  repeatTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
+
+  repeatCurrent: {
+    fontSize: 12,
+    fontWeight: "700",
+  },
+
+  recurringOptions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+
+  recurringOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+
+  recurringOptionText: {
+    fontSize: 11,
+  },
+
+  recurringWarning: {
+    color: "#D97706",
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 10,
+  },
+
   recurringCard: {
     width: "100%",
     marginTop: 2,
@@ -5474,26 +8503,6 @@ const uiStyles = StyleSheet.create({
   recurringSubtitle: {
     fontSize: 12,
     marginTop: 3,
-  },
-  recurringOptions: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-  },
-  recurringOption: {
-    paddingHorizontal: 13,
-    paddingVertical: 10,
-    borderRadius: 11,
-    borderWidth: 1,
-    minWidth: "22%",
-    alignItems: "center",
-  },
-  recurringOptionText: {
-    fontSize: 12,
-  },
-  recurringWarning: {
-    color: "#C2410C",
-    fontSize: 12,
   },
 
   // Settings grid
@@ -5603,7 +8612,7 @@ const uiStyles = StyleSheet.create({
 
   themeCard: {
     width: "48%",
-    marginBottom: 16,
+    marginBottom: 4,
     padding: 7,
     borderRadius: 17,
     borderWidth: 1.5,
@@ -5617,11 +8626,13 @@ const uiStyles = StyleSheet.create({
   },
 
   themePreview: {
-    height: 100,
+    width: "100%",
+    height: 90,
     borderRadius: 11,
     overflow: "hidden",
-    justifyContent: "center",
-    paddingHorizontal: 10,
+    position: "relative",
+    padding: 0,
+    justifyContent: "flex-start",
   },
 
   themeCardName: {
@@ -5737,7 +8748,7 @@ const uiStyles = StyleSheet.create({
   },
 
   flex: { flex: 1 },
-  screen: { flex: 1, backgroundColor: "#F2FAF9" },
+  screen: { flex: 1, backgroundColor: "#EAF8F1" },
   scrollContent: {
     paddingHorizontal: 14,
     paddingTop: 12,
@@ -5751,8 +8762,8 @@ const uiStyles = StyleSheet.create({
     alignSelf: "stretch",
     borderRadius: 20,
     borderWidth: 1,
-    borderColor: "#E5EFEC",
-    backgroundColor: "#FBFEFD",
+    borderColor: "#D3EDE0",
+    backgroundColor: "#F5FCF8",
     padding: 13,
     gap: 12,
   },
@@ -5762,7 +8773,7 @@ const uiStyles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 8,
   },
-  featureTitle: { color: "#173B38", fontSize: 16, fontWeight: "800" },
+  featureTitle: { color: "#183B32", fontSize: 16, fontWeight: "800" },
   featureSubtitle: {
     color: "#647873",
     fontSize: 13,
@@ -6006,81 +9017,6 @@ const uiStyles = StyleSheet.create({
   editorGridLine: { position: "absolute", backgroundColor: "#7BA79A30" },
   dotRow: { height: 20, justifyContent: "center" },
   dotRowText: { color: "#7BA79A55", fontSize: 20, lineHeight: 20 },
-  header: {
-    minHeight: 176,
-    paddingTop: Platform.OS === "ios" ? 16 : 12,
-    paddingHorizontal: 14,
-    paddingBottom: 56,
-    borderRadius: 26,
-    overflow: "hidden",
-    width: "100%",
-    alignSelf: "stretch",
-  },
-  headerRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    width: "100%",
-    minWidth: 0,
-  },
-  backButton: {
-    width: 47,
-    height: 47,
-    borderRadius: 24,
-    backgroundColor: "#FFFFFF",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  headerCopy: { flex: 1, minWidth: 0, marginLeft: 1 },
-  headerTitle: {
-    fontSize: 23,
-    lineHeight: 29,
-    fontWeight: "800",
-    color: "#103333",
-    flexShrink: 1,
-  },
-  headerSubtitle: {
-    marginTop: 4,
-    fontSize: 12,
-    lineHeight: 17,
-    color: "#42666A",
-    flexShrink: 1,
-  },
-  quickSave: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 4,
-    backgroundColor: "#149F8A",
-    borderRadius: 24,
-    paddingHorizontal: 8,
-    paddingVertical: 11,
-    flexShrink: 0,
-  },
-  quickSaveText: {
-    color: "#FFFFFF",
-    fontSize: 11,
-    fontWeight: "700",
-    flexShrink: 1,
-  },
-  moreButton: {
-    width: 35,
-    height: 42,
-    borderRadius: 21,
-    backgroundColor: "#FFFFFF",
-    alignItems: "center",
-    justifyContent: "center",
-    flexShrink: 0,
-  },
-  headerArt: {
-    position: "absolute",
-    right: 18,
-    bottom: 8,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    opacity: 0.55,
-  },
   editorPanel: {
     width: "100%",
     alignSelf: "stretch",
@@ -6121,6 +9057,7 @@ const uiStyles = StyleSheet.create({
     paddingVertical: 8,
   },
   counter: { color: "#6D7A8B", fontSize: 13 },
+
   contentField: {
     minHeight: 230,
     borderRadius: 20,
@@ -6128,14 +9065,12 @@ const uiStyles = StyleSheet.create({
     borderColor: "#ECF1F4",
     padding: 14,
     paddingBottom: 38,
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: 9,
     width: "100%",
     alignSelf: "stretch",
     position: "relative",
     overflow: "hidden",
   },
+
   contentInput: {
     flex: 1,
     minWidth: 0,
@@ -6306,6 +9241,7 @@ const uiStyles = StyleSheet.create({
     backgroundColor: "#F0F8F4",
     borderWidth: 1,
     borderColor: "#E0EEE7",
+    marginTop: 20,
   },
   metricText: { color: "#526B63", fontSize: 12, fontWeight: "600" },
   formatToolbar: {
@@ -6398,45 +9334,57 @@ const uiStyles = StyleSheet.create({
     justifyContent: "flex-end",
     backgroundColor: "rgba(14, 35, 31, 0.38)",
   },
-  attachmentModalBackdrop: { ...StyleSheet.absoluteFill },
+
+  attachmentModalBackdrop: {
+    ...StyleSheet.absoluteFill,
+  },
+
   attachmentModalSheet: {
     width: "100%",
-    paddingHorizontal: 18,
+    height: "50%",
+    maxHeight: "78%",
+    minHeight: 320,
+    flexShrink: 0,
+    paddingHorizontal: 14,
     paddingTop: 10,
-    paddingBottom: Platform.OS === "ios" ? 30 : 22,
-    borderTopLeftRadius: 30,
-    borderTopRightRadius: 30,
+    paddingBottom: 14,
+    borderTopLeftRadius: 26,
+    borderTopRightRadius: 26,
     backgroundColor: "#F8FBFA",
-    borderWidth: 1,
-    borderColor: "#E4EEEA",
+    overflow: "hidden",
   },
+
   attachmentModalHandle: {
     alignSelf: "center",
     width: 42,
     height: 5,
     borderRadius: 99,
     backgroundColor: "#CFDCD6",
-    marginBottom: 18,
+    marginBottom: 12,
   },
+
   attachmentModalHeader: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
-    marginBottom: 18,
+    gap: 10,
+    marginBottom: 12,
   },
+
   attachmentModalTitle: {
-    fontSize: 21,
-    lineHeight: 27,
+    fontSize: 19,
+    lineHeight: 25,
     fontWeight: "800",
     color: "#173D35",
-    letterSpacing: -0.4,
+    flexShrink: 1,
   },
+
   attachmentModalSubtitle: {
-    fontSize: 13,
-    lineHeight: 19,
+    fontSize: 12,
+    lineHeight: 17,
     color: "#71827C",
-    marginTop: 3,
+    marginTop: 2,
   },
+
   attachmentModalClose: {
     width: 38,
     height: 38,
@@ -6446,55 +9394,72 @@ const uiStyles = StyleSheet.create({
     backgroundColor: "#EDF3F0",
     borderWidth: 1,
     borderColor: "#E1EAE5",
+    flexShrink: 0,
   },
+
+  attachmentModalScroll: {
+    flexGrow: 0,
+    flexShrink: 1,
+    minHeight: 0,
+  },
+
+  attachmentModalScrollContent: {
+    paddingBottom: 12,
+    flexGrow: 1,
+  },
+
   attachmentModalGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 10,
+    gap: 9,
     width: "100%",
     alignItems: "stretch",
   },
+
   attachmentTile: {
     flexGrow: 1,
     flexBasis: "29%",
-    minWidth: 88,
-    minHeight: 124,
-    borderRadius: 20,
+    minWidth: 85,
+    minHeight: 100,
+    borderRadius: 16,
     borderWidth: 1,
     alignItems: "center",
-    justifyContent: "flex-start",
-    paddingHorizontal: 8,
-    paddingTop: 12,
-    paddingBottom: 10,
-    gap: 8,
+    justifyContent: "center",
+    paddingHorizontal: 6,
+    paddingVertical: 8,
+    gap: 6,
     shadowColor: "#183B34",
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.045,
-    shadowRadius: 7,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.04,
+    shadowRadius: 5,
     elevation: 1,
   },
+
+  attachmentIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 13,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  attachmentTileLabel: {
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: "700",
+    textAlign: "center",
+    color: "#203D38",
+    minHeight: 28,
+  },
+
   attachmentTilePressed: {
     transform: [{ scale: 0.97 }],
     opacity: 0.92,
     shadowOpacity: 0.015,
     elevation: 0,
   },
-  attachmentIconWrap: {
-    width: 48,
-    height: 48,
-    borderRadius: 16,
-    borderWidth: 1,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  attachmentTileLabel: {
-    fontSize: 12,
-    lineHeight: 16,
-    fontWeight: "700",
-    textAlign: "center",
-    color: "#203D38",
-    minHeight: 30,
-  },
+
   attachmentTileHint: {
     flexDirection: "row",
     alignItems: "center",
@@ -6502,11 +9467,13 @@ const uiStyles = StyleSheet.create({
     gap: 4,
     marginTop: "auto",
   },
+
   attachmentTileHintText: {
     fontSize: 10,
     fontWeight: "800",
     letterSpacing: 0.25,
   },
+
   attachmentTray: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -6599,6 +9566,672 @@ const uiStyles = StyleSheet.create({
 });
 
 const styles = StyleSheet.create({
+  hyperlinkOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(15, 35, 30, 0.48)",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 20,
+  },
+
+  hyperlinkModal: {
+    width: "100%",
+    maxWidth: 460,
+    maxHeight: "78%",
+    backgroundColor: "#FFFFFF",
+    borderRadius: 24,
+    padding: 20,
+    elevation: 12,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.16,
+    shadowRadius: 18,
+  },
+
+  hyperlinkHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 18,
+  },
+
+  hyperlinkHeaderLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    gap: 12,
+  },
+
+  hyperlinkIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 15,
+    backgroundColor: "#E5F5EF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  hyperlinkTitle: {
+    fontSize: 18,
+    fontWeight: "800",
+    color: "#172F2B",
+  },
+
+  hyperlinkSubtitle: {
+    fontSize: 12,
+    color: "#71827D",
+    marginTop: 4,
+  },
+
+  hyperlinkClose: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    backgroundColor: "#F2F7F4",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  hyperlinkCount: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    backgroundColor: "#EFF8F4",
+    alignSelf: "flex-start",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    marginBottom: 14,
+  },
+
+  hyperlinkCountText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#208A75",
+  },
+
+  hyperlinkScroll: {
+    flexGrow: 0,
+    marginBottom: 16,
+  },
+
+  hyperlinkItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 13,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: "#E4ECE7",
+    backgroundColor: "#FFFFFF",
+    marginBottom: 9,
+    gap: 11,
+  },
+
+  hyperlinkItemSelected: {
+    borderColor: "#208A75",
+    backgroundColor: "#F0FAF6",
+    borderWidth: 1.5,
+  },
+
+  hyperlinkNumber: {
+    width: 34,
+    height: 34,
+    borderRadius: 11,
+    backgroundColor: "#F0F5F2",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  hyperlinkNumberSelected: {
+    backgroundColor: "#208A75",
+  },
+
+  hyperlinkNumberText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#71827D",
+  },
+
+  hyperlinkNumberTextSelected: {
+    color: "#FFFFFF",
+  },
+
+  hyperlinkContent: {
+    flex: 1,
+  },
+
+  hyperlinkLabel: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#263D36",
+    marginBottom: 5,
+  },
+
+  hyperlinkUrl: {
+    fontSize: 12,
+    color: "#71827D",
+    lineHeight: 18,
+  },
+
+  hyperlinkFooter: {
+    flexDirection: "row",
+    gap: 10,
+    paddingTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: "#EAF0EC",
+  },
+
+  hyperlinkCancelButton: {
+    flex: 1,
+    height: 48,
+    borderRadius: 14,
+    backgroundColor: "#F1F5F2",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  hyperlinkCancelText: {
+    color: "#52645E",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+
+  hyperlinkOpenButton: {
+    flex: 1.4,
+    height: 48,
+    borderRadius: 14,
+    backgroundColor: "#208A75",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+
+  hyperlinkOpenDisabled: {
+    backgroundColor: "#A8C9BD",
+  },
+
+  hyperlinkOpenText: {
+    color: "#FFFFFF",
+    fontSize: 14,
+    fontWeight: "800",
+  },
+
+  drawingScreen: {
+    flex: 1,
+    backgroundColor: "#F5FAF8",
+  },
+
+  drawingHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 11,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 14,
+  },
+
+  drawingHeaderButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    backgroundColor: "#E8F4EF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  drawingHeaderText: {
+    justifyContent: "center",
+  },
+
+  drawingTitle: {
+    fontSize: 19,
+    fontWeight: "800",
+    color: "#183D34",
+  },
+
+  drawingSubtitle: {
+    fontSize: 12,
+    color: "#758A83",
+    marginTop: 3,
+  },
+
+  drawingSaveButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    minHeight: 40,
+    paddingHorizontal: 13,
+    borderRadius: 12,
+    backgroundColor: "#18A98B",
+  },
+
+  drawingSaveButtonText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+    fontSize: 13,
+  },
+
+  drawingToolbarCard: {
+    marginHorizontal: 14,
+    marginBottom: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 17,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E3EEE9",
+  },
+
+  drawingToolbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-around",
+    gap: 4,
+    paddingVertical: 5,
+  },
+
+  drawingToolButton: {
+    minWidth: 38,
+    height: 38,
+    paddingHorizontal: 7,
+    borderRadius: 11,
+    backgroundColor: "#F3F7F5",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  drawingToolButtonActive: {
+    backgroundColor: "#D9F5EA",
+    borderWidth: 1,
+    borderColor: "#18A98B",
+  },
+
+  drawingToolbarDivider: {
+    width: 1,
+    height: 25,
+    backgroundColor: "#E2EAE6",
+    marginHorizontal: 3,
+  },
+
+  drawingBrushControl: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-around",
+    flexWrap: "wrap",
+    gap: 7,
+    paddingTop: 8,
+    paddingBottom: 5,
+  },
+
+  drawingBrushLabel: {
+    color: "#64776F",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+
+  brushSizeOption: {
+    width: 31,
+    height: 31,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#E1EAE5",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#FFFFFF",
+  },
+
+  brushSizeOptionActive: {
+    borderColor: "#18A98B",
+    backgroundColor: "#E0F7EE",
+  },
+
+  brushDot: {
+    borderRadius: 20,
+    backgroundColor: "#183D34",
+  },
+
+  drawingColorRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    flexWrap: "wrap",
+    gap: 7,
+  },
+
+  drawingColorSwatch: {
+    width: 23,
+    height: 23,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#D5E0DA",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  drawingColorSwatchSelected: {
+    borderWidth: 2,
+    borderColor: "#18A98B",
+    transform: [{ scale: 1.08 }],
+  },
+
+  handwritingEditorCard: {
+    marginHorizontal: 14,
+    marginBottom: 12,
+    padding: 12,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E1EEE8",
+    borderRadius: 17,
+  },
+
+  handwritingEditorHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 9,
+  },
+
+  handwritingEditorHeading: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+
+  handwritingEditorTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#183D34",
+  },
+
+  handwritingEditorHint: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#16866F",
+    backgroundColor: "#E6F7F0",
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 20,
+  },
+
+  handwritingTextInput: {
+    minHeight: 58,
+    maxHeight: 95,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: "#E5ECE8",
+    backgroundColor: "#FAFCFB",
+    color: "#183D34",
+    fontSize: 16,
+    lineHeight: 23,
+    textAlignVertical: "top",
+  },
+
+  handwritingRecognitionStatus: {
+    fontSize: 11,
+    lineHeight: 16,
+    color: "#64776F",
+    marginTop: 6,
+    marginBottom: 5,
+  },
+
+  handwritingConvertButton: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    paddingHorizontal: 14,
+    marginTop: 9,
+    borderRadius: 11,
+    backgroundColor: "#18A98B",
+  },
+
+  handwritingConvertButtonText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+
+  handwritingConvertButtonDisabled: {
+    opacity: 0.55,
+  },
+
+  drawingCanvasHeading: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginHorizontal: 17,
+    marginBottom: 9,
+  },
+
+  drawingCanvasTitle: {
+    color: "#183D34",
+    fontSize: 14,
+    fontWeight: "800",
+  },
+
+  drawingCanvasSubtitle: {
+    color: "#82928B",
+    fontSize: 11,
+    marginTop: 3,
+  },
+
+  drawingCanvasBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    borderRadius: 20,
+    backgroundColor: "#E5F7EF",
+  },
+
+  drawingCanvasBadgeDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: "#18A98B",
+  },
+
+  drawingCanvasBadgeText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#16866F",
+  },
+
+  drawingCanvasOuter: {
+    flex: 1,
+    minHeight: 120,
+    marginHorizontal: 14,
+    marginBottom: 10,
+    borderRadius: 17,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "#DCEAE3",
+    backgroundColor: "#FFFFFF",
+  },
+
+  drawingCanvas: {
+    flex: 1,
+    width: "100%",
+    minHeight: 120,
+    backgroundColor: "#FFFFFF",
+    overflow: "hidden",
+  },
+
+  drawingBottomActions: {
+    flexDirection: "row",
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingTop: 5,
+    paddingBottom: 10,
+    backgroundColor: "#F5FAF8",
+  },
+
+  drawingTextAction: {
+    flex: 1,
+    minHeight: 48,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: "#BCE7D8",
+    backgroundColor: "#FFFFFF",
+  },
+
+  drawingTextActionLabel: {
+    color: "#16866F",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+
+  drawingImageAction: {
+    flex: 1,
+    minHeight: 48,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    borderRadius: 13,
+    backgroundColor: "#18A98B",
+  },
+
+  drawingImageActionLabel: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+
+  /* Handwriting language and recognition */
+  handwritingRecognitionBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginTop: 6,
+    marginBottom: 6,
+    backgroundColor: "#F0FAF6",
+    borderRadius: 12,
+  },
+
+  reminderCard: {
+    borderWidth: 1,
+    borderRadius: 18,
+    padding: 14,
+    marginVertical: 8,
+  },
+
+  reminderHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    minHeight: 48,
+  },
+
+  reminderIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  reminderTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+  },
+
+  reminderSubtitle: {
+    fontSize: 12,
+    marginTop: 4,
+  },
+
+  reminderDivider: {
+    height: 1,
+    marginVertical: 14,
+  },
+
+  repeatHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    marginBottom: 12,
+  },
+
+  repeatTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
+
+  repeatCurrent: {
+    fontSize: 12,
+    fontWeight: "700",
+  },
+
+  fontSizeControl: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    alignSelf: "flex-start",
+    padding: 5,
+    gap: 6,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#D7EDE1",
+    backgroundColor: "#F1FAF5",
+  },
+
+  fontSizeButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 11,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#DCEDE3",
+  },
+
+  fontSizeButtonDisabled: {
+    backgroundColor: "#F0F3F1",
+    borderColor: "#E7ECE8",
+  },
+
+  fontSizeButtonPressed: {
+    backgroundColor: "#DDF3E6",
+    transform: [{ scale: 0.94 }],
+  },
+
+  fontSizeValueBox: {
+    minWidth: 44,
+    height: 36,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 3,
+  },
+
+  fontSizeText: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#245C42",
+    textAlign: "center",
+  },
+
+  fontSizeUnit: {
+    fontSize: 10,
+    fontWeight: "600",
+    color: "#729581",
+  },
   videoPreviewCard: {
     width: 220,
     marginTop: 12,
@@ -6951,23 +10584,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#536A63",
   },
-  fontSizeControl: {
-    height: 36,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 5,
-    paddingHorizontal: 8,
-    borderRadius: 10,
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#DCEAE5",
-  },
-  fontSizeText: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#536A63",
-  },
+
   characterCount: {
     fontSize: 11,
     color: "#8AA19A",
@@ -7686,12 +11303,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
   },
-  drawingScreen: {
-    flex: 1,
-    backgroundColor: "#F3F6FC",
-    paddingHorizontal: 16,
-    paddingTop: 4,
-  },
+
   drawingScrollView: {
     flex: 1,
     width: "100%",
@@ -7700,156 +11312,7 @@ const styles = StyleSheet.create({
     paddingBottom: 28,
     flexGrow: 1,
   },
-  drawingHeader: {
-    minHeight: 76,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 11,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "#E4EAF4",
-    marginBottom: 10,
-  },
-  drawingHeaderButton: {
-    width: 42,
-    height: 42,
-    borderRadius: 15,
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#E2E8F2",
-    alignItems: "center",
-    justifyContent: "center",
-    shadowColor: "#176B5D",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 5,
-    elevation: 2,
-  },
-  drawingHeaderText: {
-    flex: 1,
-    gap: 3,
-  },
-  drawingTitle: {
-    color: "#17233F",
-    fontSize: 19,
-    fontWeight: "800",
-    letterSpacing: -0.4,
-  },
-  drawingSubtitle: {
-    color: "#75819A",
-    fontSize: 11,
-    lineHeight: 15,
-  },
-  drawingSaveButton: {
-    minHeight: 42,
-    paddingHorizontal: 15,
-    borderRadius: 14,
-    backgroundColor: COLORS.primary,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    shadowColor: COLORS.primary,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
-    shadowRadius: 7,
-    elevation: 3,
-  },
-  drawingSaveButtonText: {
-    color: "#FFFFFF",
-    fontSize: 13,
-    fontWeight: "800",
-  },
-  drawingToolbar: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 7,
-    padding: 9,
-    flexWrap: "wrap",
-    backgroundColor: "#FFFFFF",
-    borderRadius: 17,
-    borderWidth: 1,
-    borderColor: "#E4EAF4",
-    marginBottom: 8,
-    shadowColor: "#1E293B",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.035,
-    shadowRadius: 6,
-    elevation: 1,
-  },
-  drawingToolButton: {
-    width: 39,
-    height: 39,
-    borderRadius: 12,
-    backgroundColor: "#F7F9FD",
-    borderWidth: 1,
-    borderColor: "#E7ECF5",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  drawingToolButtonActive: {
-    backgroundColor: "#E0F4EE",
-    borderColor: COLORS.primary,
-    borderWidth: 1.5,
-  },
-  drawingBrushControl: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 3,
-    marginLeft: "auto",
-    paddingLeft: 5,
-  },
-  drawingBrushLabel: {
-    color: "#7A859B",
-    fontSize: 10,
-    fontWeight: "800",
-    marginRight: 2,
-    textTransform: "uppercase",
-    letterSpacing: 0.4,
-  },
-  brushSizeOption: {
-    width: 28,
-    height: 32,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 1,
-    borderColor: "transparent",
-  },
-  brushSizeOptionActive: {
-    backgroundColor: "#E0F4EE",
-    borderColor: COLORS.primary,
-  },
-  brushDot: {
-    borderRadius: 20,
-    backgroundColor: "#172F2B",
-  },
-  drawingColorRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 11,
-    paddingVertical: 10,
-    flexWrap: "wrap",
-    backgroundColor: "#FFFFFF",
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: "#E4EAF4",
-    marginBottom: 9,
-  },
-  drawingColorSwatch: {
-    width: 25,
-    height: 25,
-    borderRadius: 13,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 2,
-    borderColor: "transparent",
-  },
-  drawingColorSwatchSelected: {
-    borderColor: COLORS.primary,
-    transform: [{ scale: 1.12 }],
-  },
+
   drawingWhiteSwatch: {
     borderColor: "#CBD5E1",
   },
@@ -7859,13 +11322,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginLeft: "auto",
   },
-  handwritingRecognitionBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "flex-end",
-    gap: 8,
-    marginBottom: 5,
-  },
+
   handwritingLanguageChoices: {
     flexDirection: "row",
     alignItems: "center",
@@ -7893,36 +11350,11 @@ const styles = StyleSheet.create({
   handwritingLanguageTextActive: {
     color: COLORS.primary,
   },
-  handwritingConvertButton: {
-    minHeight: 39,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 7,
-    paddingHorizontal: 15,
-    borderRadius: 12,
-    backgroundColor: COLORS.primary,
-    shadowColor: COLORS.primary,
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.16,
-    shadowRadius: 5,
-    elevation: 2,
-  },
+
   handwritingConvertButtonDisabled: {
     opacity: 0.6,
   },
-  handwritingConvertButtonText: {
-    color: "#FFFFFF",
-    fontSize: 12,
-    fontWeight: "800",
-  },
-  handwritingRecognitionStatus: {
-    color: "#71809A",
-    fontSize: 10,
-    lineHeight: 14,
-    marginBottom: 6,
-    paddingHorizontal: 3,
-  },
+
   handwritingTextPanel: {
     backgroundColor: "#FFFFFF",
     borderRadius: 17,
@@ -8069,22 +11501,6 @@ const styles = StyleSheet.create({
     gap: 10,
   },
 
-  fontSizeButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 15,
-    backgroundColor: "#EAF7F2",
-    borderWidth: 1,
-    borderColor: "#D7EEE6",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  fontSizeButtonPressed: {
-    backgroundColor: "#D7F0E7",
-    transform: [{ scale: 0.94 }],
-  },
-
   disabledControl: {
     backgroundColor: "#F1F4F3",
     borderColor: "#E8EEEC",
@@ -8128,19 +11544,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#20A58B",
   },
 
-  handwritingTextInput: {
-    minHeight: 56,
-    maxHeight: 96,
-    color: "#17233F",
-    fontSize: 15,
-    lineHeight: 22,
-    paddingHorizontal: 11,
-    paddingVertical: 9,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#E5EAF3",
-    backgroundColor: "#FAFBFE",
-  },
   handwritingTextHint: {
     color: "#8AA19A",
     fontSize: 10,
@@ -8171,25 +11574,7 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     minHeight: 20,
   },
-  drawingCanvasOuter: {
-    flex: 1,
-    minHeight: 220,
-    paddingBottom: 5,
-  },
-  drawingCanvas: {
-    flex: 1,
-    minHeight: 220,
-    backgroundColor: "#FFFFFF",
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: "#DCEAE5",
-    overflow: "hidden",
-    shadowColor: "#176B5D",
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.055,
-    shadowRadius: 8,
-    elevation: 2,
-  },
+
   drawingFooterHint: {
     color: "#8AA19A",
     fontSize: 10,

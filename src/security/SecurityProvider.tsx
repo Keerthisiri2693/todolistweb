@@ -1,4 +1,3 @@
-
 import React, {
   createContext,
   useCallback,
@@ -8,20 +7,20 @@ import React, {
   useState,
 } from "react";
 
-import { AppState } from "react-native";
 import * as LocalAuthentication from "expo-local-authentication";
+import { AppState, Platform } from "react-native";
 
 import {
   type SecurityConfig,
-  readSecurityConfig,
-  writeSecurityConfig,
-  saveNewPin,
-  verifyPin as verifyStoredPin,
-  saveNewPattern,
-  verifyPattern as verifyStoredPattern,
-  removePattern,
   readLockedNoteIds,
+  readSecurityConfig,
+  removePattern,
+  saveNewPattern,
+  saveNewPin,
+  verifyPattern as verifyStoredPattern,
+  verifyPin as verifyStoredPin,
   writeLockedNoteIds,
+  writeSecurityConfig,
 } from "./security-store";
 
 type SecurityContextValue = {
@@ -34,26 +33,16 @@ type SecurityContextValue = {
   setPin: (pin: string) => Promise<void>;
   unlockWithPin: (pin: string) => Promise<boolean>;
   unlockWithBiometrics: () => Promise<boolean>;
-  changePin: (
-    oldPin: string,
-    newPin: string
-  ) => Promise<boolean>;
+  changePin: (oldPin: string, newPin: string) => Promise<boolean>;
 
   setPattern: (pattern: number[]) => Promise<void>;
-  unlockWithPattern: (
-    pattern: number[]
-  ) => Promise<boolean>;
+  unlockWithPattern: (pattern: number[]) => Promise<boolean>;
   removeAppPattern: () => Promise<void>;
 
   lockNote: (id: string) => Promise<void>;
-  unlockNoteWithPin: (
-    id: string,
-    pin: string
-  ) => Promise<boolean>;
+  unlockNoteWithPin: (id: string, pin: string) => Promise<boolean>;
 
-  updateSettings: (
-    changes: Partial<SecurityConfig>
-  ) => Promise<void>;
+  updateSettings: (changes: Partial<SecurityConfig>) => Promise<void>;
 
   enableAppLock: () => Promise<void>;
   disableAppLock: () => Promise<void>;
@@ -64,8 +53,7 @@ type SecurityContextValue = {
   endExternalActivity: () => void;
 };
 
-const SecurityContext =
-  createContext<SecurityContextValue | null>(null);
+const SecurityContext = createContext<SecurityContextValue | null>(null);
 
 const DEFAULT_CONFIG: SecurityConfig = {
   pinSalt: "",
@@ -78,26 +66,18 @@ const DEFAULT_CONFIG: SecurityConfig = {
   autoLockEnabled: true,
 };
 
-export function SecurityProvider({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export function SecurityProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
 
-  const [config, setConfig] =
-    useState<SecurityConfig>(DEFAULT_CONFIG);
+  const [config, setConfig] = useState<SecurityConfig>(DEFAULT_CONFIG);
 
   const [isLocked, setIsLocked] = useState(false);
 
-  const [lockedNoteIds, setLockedNoteIds] =
-    useState<string[]>([]);
+  const [lockedNoteIds, setLockedNoteIds] = useState<string[]>([]);
 
-  const [unlockedNoteIds, setUnlockedNoteIds] =
-    useState<string[]>([]);
+  const [unlockedNoteIds, setUnlockedNoteIds] = useState<string[]>([]);
 
-  const configRef =
-    useRef<SecurityConfig>(DEFAULT_CONFIG);
+  const configRef = useRef<SecurityConfig>(DEFAULT_CONFIG);
 
   const biometricInProgress = useRef(false);
 
@@ -125,9 +105,9 @@ export function SecurityProvider({
     (value: SecurityConfig) =>
       Boolean(
         (value.pinHash && value.pinSalt) ||
-          (value.patternHash && value.patternSalt)
+        (value.patternHash && value.patternSalt),
       ),
-    []
+    [],
   );
 
   // Load saved security settings and note locks.
@@ -136,11 +116,10 @@ export function SecurityProvider({
 
     async function initialize() {
       try {
-        const [savedConfig, savedNoteIds] =
-          await Promise.all([
-            readSecurityConfig(),
-            readLockedNoteIds(),
-          ]);
+        const [savedConfig, savedNoteIds] = await Promise.all([
+          readSecurityConfig(),
+          readLockedNoteIds(),
+        ]);
 
         if (!mounted) return;
 
@@ -152,23 +131,15 @@ export function SecurityProvider({
         configRef.current = initialConfig;
         setConfig(initialConfig);
 
-        setLockedNoteIds(
-          Array.isArray(savedNoteIds)
-            ? savedNoteIds
-            : []
-        );
+        setLockedNoteIds(Array.isArray(savedNoteIds) ? savedNoteIds : []);
 
         setIsLocked(
           Boolean(
-            initialConfig.appLockEnabled &&
-              hasUnlockMethod(initialConfig)
-          )
+            initialConfig.appLockEnabled && hasUnlockMethod(initialConfig),
+          ),
         );
       } catch (error) {
-        console.error(
-          "Failed to load security settings:",
-          error
-        );
+        console.error("Failed to load security settings:", error);
       } finally {
         if (mounted) setReady(true);
       }
@@ -184,37 +155,33 @@ export function SecurityProvider({
   // Auto-lock when the app leaves the foreground,
   // except while the gallery or another external picker is open.
   useEffect(() => {
-    const subscription = AppState.addEventListener(
-      "change",
-      (nextState) => {
-        const previousState = appStateRef.current;
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      const previousState = appStateRef.current;
 
-        const leavingForeground =
-          previousState === "active" &&
-          nextState !== "active";
+      const leavingForeground =
+        previousState === "active" && nextState !== "active";
 
-        if (leavingForeground) {
-          const current = configRef.current;
+      if (leavingForeground) {
+        const current = configRef.current;
 
-          const shouldAutoLock =
-            !externalActivityInProgress.current &&
-            !biometricInProgress.current &&
-            current.appLockEnabled &&
-            current.autoLockEnabled &&
-            hasUnlockMethod(current);
+        const shouldAutoLock =
+          !externalActivityInProgress.current &&
+          !biometricInProgress.current &&
+          current.appLockEnabled &&
+          current.autoLockEnabled &&
+          hasUnlockMethod(current);
 
-          if (shouldAutoLock) {
-            setIsLocked(true);
-          }
-
-          if (!externalActivityInProgress.current) {
-            setUnlockedNoteIds([]);
-          }
+        if (shouldAutoLock) {
+          setIsLocked(true);
         }
 
-        appStateRef.current = nextState;
+        if (!externalActivityInProgress.current) {
+          setUnlockedNoteIds([]);
+        }
       }
-    );
+
+      appStateRef.current = nextState;
+    });
 
     return () => subscription.remove();
   }, [hasUnlockMethod]);
@@ -229,12 +196,9 @@ export function SecurityProvider({
         ...changes,
       };
 
-      if (
-        changes.appLockEnabled === true &&
-        !hasUnlockMethod(next)
-      ) {
+      if (changes.appLockEnabled === true && !hasUnlockMethod(next)) {
         throw new Error(
-          "Create a security PIN or pattern before enabling App Lock."
+          "Create a security PIN or pattern before enabling App Lock.",
         );
       }
 
@@ -247,7 +211,7 @@ export function SecurityProvider({
         setIsLocked(false);
       }
     },
-    [hasUnlockMethod]
+    [hasUnlockMethod],
   );
 
   // Enable app lock.
@@ -255,9 +219,7 @@ export function SecurityProvider({
     const current = configRef.current;
 
     if (!hasUnlockMethod(current)) {
-      throw new Error(
-        "Please create a security PIN or pattern first."
-      );
+      throw new Error("Please create a security PIN or pattern first.");
     }
 
     const next: SecurityConfig = {
@@ -302,46 +264,36 @@ export function SecurityProvider({
   }, []);
 
   // Unlock app with PIN.
-  const unlockWithPin = useCallback(
-    async (pin: string) => {
-      const correct = await verifyStoredPin(pin);
+  const unlockWithPin = useCallback(async (pin: string) => {
+    const correct = await verifyStoredPin(pin);
 
-      if (correct) {
-        setIsLocked(false);
-      }
+    if (correct) {
+      setIsLocked(false);
+    }
 
-      return correct;
-    },
-    []
-  );
+    return correct;
+  }, []);
 
   // Set or replace the pattern.
-  const setPattern = useCallback(
-    async (pattern: number[]) => {
-      await saveNewPattern(pattern);
+  const setPattern = useCallback(async (pattern: number[]) => {
+    await saveNewPattern(pattern);
 
-      const next = await readSecurityConfig();
+    const next = await readSecurityConfig();
 
-      configRef.current = next;
-      setConfig(next);
-    },
-    []
-  );
+    configRef.current = next;
+    setConfig(next);
+  }, []);
 
   // Unlock app with pattern.
-  const unlockWithPattern = useCallback(
-    async (pattern: number[]) => {
-      const correct =
-        await verifyStoredPattern(pattern);
+  const unlockWithPattern = useCallback(async (pattern: number[]) => {
+    const correct = await verifyStoredPattern(pattern);
 
-      if (correct) {
-        setIsLocked(false);
-      }
+    if (correct) {
+      setIsLocked(false);
+    }
 
-      return correct;
-    },
-    []
-  );
+    return correct;
+  }, []);
 
   // Remove pattern. Disable app lock if no PIN remains.
   const removeAppPattern = useCallback(async () => {
@@ -349,18 +301,12 @@ export function SecurityProvider({
 
     const saved = await readSecurityConfig();
 
-    const hasPin = Boolean(
-      saved.pinHash && saved.pinSalt
-    );
+    const hasPin = Boolean(saved.pinHash && saved.pinSalt);
 
     const next: SecurityConfig = {
       ...saved,
-      appLockEnabled: hasPin
-        ? saved.appLockEnabled
-        : false,
-      biometricEnabled: hasPin
-        ? saved.biometricEnabled
-        : false,
+      appLockEnabled: hasPin ? saved.appLockEnabled : false,
+      biometricEnabled: hasPin ? saved.biometricEnabled : false,
     };
 
     await writeSecurityConfig(next);
@@ -374,83 +320,73 @@ export function SecurityProvider({
   }, []);
 
   // Unlock app using device biometrics.
-  const unlockWithBiometrics = useCallback(
-    async () => {
-      const current = configRef.current;
+  const unlockWithBiometrics = useCallback(async () => {
+    // Electron/Web does not provide Expo device biometrics.
+    // Keep biometric authentication available on supported native devices.
+    if (Platform.OS === "web") return false;
 
-      if (
-        !current.biometricEnabled ||
-        !current.appLockEnabled ||
-        !(current.pinHash && current.pinSalt)
-      ) {
+    const current = configRef.current;
+
+    if (
+      !current.biometricEnabled ||
+      !current.appLockEnabled ||
+      !(current.pinHash && current.pinSalt)
+    ) {
+      return false;
+    }
+
+    try {
+      const hardwareAvailable = await LocalAuthentication.hasHardwareAsync();
+
+      const enrolled = await LocalAuthentication.isEnrolledAsync();
+
+      if (!hardwareAvailable || !enrolled) {
         return false;
       }
 
-      try {
-        const hardwareAvailable =
-          await LocalAuthentication.hasHardwareAsync();
+      biometricInProgress.current = true;
 
-        const enrolled =
-          await LocalAuthentication.isEnrolledAsync();
+      const result = await LocalAuthentication.authenticateAsync({
+        promptMessage: "Unlock your private notes",
+        cancelLabel: "Use PIN",
+        disableDeviceFallback: true,
+        biometricsSecurityLevel: "strong",
+      });
 
-        if (!hardwareAvailable || !enrolled) {
-          return false;
-        }
-
-        biometricInProgress.current = true;
-
-        const result =
-          await LocalAuthentication.authenticateAsync({
-            promptMessage: "Unlock your private notes",
-            cancelLabel: "Use PIN",
-            disableDeviceFallback: true,
-            biometricsSecurityLevel: "strong",
-          });
-
-        if (result.success) {
-          setIsLocked(false);
-          return true;
-        }
-
-        return false;
-      } catch (error) {
-        console.warn(
-          "Biometric authentication failed:",
-          error
-        );
-
-        return false;
-      } finally {
-        biometricInProgress.current = false;
+      if (result.success) {
+        setIsLocked(false);
+        return true;
       }
-    },
-    []
-  );
+
+      return false;
+    } catch (error) {
+      console.warn("Biometric authentication failed:", error);
+
+      return false;
+    } finally {
+      biometricInProgress.current = false;
+    }
+  }, []);
 
   // Change PIN after verifying the current PIN.
-  const changePin = useCallback(
-    async (oldPin: string, newPin: string) => {
-      if (!/^\d{6,8}$/.test(newPin)) {
-        throw new Error(
-          "PIN must contain 6–8 digits."
-        );
-      }
+  const changePin = useCallback(async (oldPin: string, newPin: string) => {
+    if (!/^\d{6,8}$/.test(newPin)) {
+      throw new Error("PIN must contain 6–8 digits.");
+    }
 
-      const correct = await verifyStoredPin(oldPin);
+    const correct = await verifyStoredPin(oldPin);
 
-      if (!correct) return false;
+    if (!correct) return false;
 
-      await saveNewPin(newPin);
+    await saveNewPin(newPin);
 
-      const next = await readSecurityConfig();
+    const next = await readSecurityConfig();
 
-      configRef.current = next;
-      setConfig(next);
+    configRef.current = next;
+    setConfig(next);
 
-      return true;
-    },
-    []
-  );
+    return true;
+  }, []);
 
   // Lock an individual note.
   const lockNote = useCallback(
@@ -458,58 +394,44 @@ export function SecurityProvider({
       const noteId = String(id).trim();
 
       if (!noteId) {
-        throw new Error(
-          "A valid note ID is required."
-        );
+        throw new Error("A valid note ID is required.");
       }
 
-      const next = [
-        ...new Set([...lockedNoteIds, noteId]),
-      ];
+      const next = [...new Set([...lockedNoteIds, noteId])];
 
       await writeLockedNoteIds(next);
       setLockedNoteIds(next);
 
       setUnlockedNoteIds((previous) =>
-        previous.filter((item) => item !== noteId)
+        previous.filter((item) => item !== noteId),
       );
     },
-    [lockedNoteIds]
+    [lockedNoteIds],
   );
 
   // Unlock an individual note using the PIN.
-  const unlockNoteWithPin = useCallback(
-    async (id: string, pin: string) => {
-      const correct = await verifyStoredPin(pin);
+  const unlockNoteWithPin = useCallback(async (id: string, pin: string) => {
+    const correct = await verifyStoredPin(pin);
 
-      if (!correct) return false;
+    if (!correct) return false;
 
-      setUnlockedNoteIds((previous) =>
-        previous.includes(id)
-          ? previous
-          : [...previous, id]
-      );
+    setUnlockedNoteIds((previous) =>
+      previous.includes(id) ? previous : [...previous, id],
+    );
 
-      return true;
-    },
-    []
-  );
+    return true;
+  }, []);
 
   const isNoteLocked = useCallback(
-    (id: string) =>
-      lockedNoteIds.includes(id) &&
-      !unlockedNoteIds.includes(id),
-    [lockedNoteIds, unlockedNoteIds]
+    (id: string) => lockedNoteIds.includes(id) && !unlockedNoteIds.includes(id),
+    [lockedNoteIds, unlockedNoteIds],
   );
 
   // Manually lock the app.
   const lockApp = useCallback(() => {
     const current = configRef.current;
 
-    if (
-      current.appLockEnabled &&
-      hasUnlockMethod(current)
-    ) {
+    if (current.appLockEnabled && hasUnlockMethod(current)) {
       setIsLocked(true);
     }
 
@@ -555,9 +477,7 @@ export function useSecurity() {
   const value = useContext(SecurityContext);
 
   if (!value) {
-    throw new Error(
-      "useSecurity must be used inside SecurityProvider."
-    );
+    throw new Error("useSecurity must be used inside SecurityProvider.");
   }
 
   return value;

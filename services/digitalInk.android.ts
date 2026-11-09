@@ -1,0 +1,1 @@
+export { NitroDigitalInk } from "@nitro-mlkit/digital-ink";

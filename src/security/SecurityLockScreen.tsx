@@ -4,8 +4,8 @@ import {
   ActivityIndicator,
   Keyboard,
   PanResponder,
+  Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -15,6 +15,7 @@ import {
   View,
 } from "react-native";
 import { useSecurity } from "./SecurityProvider";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function SecurityLockScreen() {
   const { unlockWithPin, unlockWithPattern, unlockWithBiometrics, config } = useSecurity();
@@ -85,7 +86,7 @@ export default function SecurityLockScreen() {
   };
 
   const submitBiometrics = async () => {
-    if (busy) return;
+    if (busy || Platform.OS === "web") return;
 
     setBusy(true);
     setError("");
@@ -192,14 +193,14 @@ export default function SecurityLockScreen() {
           {hasPattern && (
             <View style={styles.modeSwitch}>
               <Pressable
-                onPress={() => { setUnlockMode("pin"); setPatternError(""); }}
+                onPress={() => { setUnlockMode("pin"); setPatternError(""); setError(""); }}
                 style={[styles.modeButton, unlockMode === "pin" && { backgroundColor: colors.accent }]}
                 accessibilityRole="button"
               >
                 <Text style={[styles.modeButtonText, { color: unlockMode === "pin" ? colors.white : colors.text }]}>PIN</Text>
               </Pressable>
               <Pressable
-                onPress={() => { setUnlockMode("pattern"); setError(""); }}
+                onPress={() => { setUnlockMode("pattern"); setError(""); setPatternError(""); }}
                 style={[styles.modeButton, unlockMode === "pattern" && { backgroundColor: colors.accent }]}
                 accessibilityRole="button"
               >
@@ -226,7 +227,7 @@ export default function SecurityLockScreen() {
                 <Text
                   style={[styles.cardSubtitle, { color: colors.secondary }]}
                 >
-                  Enter your 6–8 digit PIN
+                  {unlockMode === "pin" ? "Enter your 6–8 digit PIN" : "Draw your saved unlock pattern"}
                 </Text>
               </View>
 
@@ -338,7 +339,7 @@ export default function SecurityLockScreen() {
                   disabled={patternBusy}
                   accent={colors.accent}
                   borderColor={colors.border}
-                  onComplete={(value) => void submitPattern(value)}
+                  onComplete={(value) => { setPatternError(""); void submitPattern(value); }}
                 />
                 {patternBusy && <ActivityIndicator color={colors.accent} style={{ marginTop: 10 }} />}
                 {!!patternError && (
@@ -350,7 +351,7 @@ export default function SecurityLockScreen() {
               </View>
             )}
 
-            {config.biometricEnabled && (
+            {Platform.OS !== "web" && config.biometricEnabled && (
               <>
                 <View style={styles.separator}>
                   <View

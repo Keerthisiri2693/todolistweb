@@ -11,7 +11,7 @@
     "web": "expo start --web",
     "build:web": "expo export --platform web",
     "desktop": "npm run build:web && electron electron/main.cjs",
-    "desktop:build": "npm run build:web && electron-builder --win nsis",
+    "desktop:build": "npm run build:web && electron-builder --win nsis --publish never",
     "lint": "expo lint"
   },
   "dependencies": {
@@ -20,6 +20,7 @@
     "@nitro-mlkit/digital-ink": "^0.1.0-beta.0",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/datetimepicker": "9.1.0",
+    "@react-native-community/netinfo": "12.0.1",
     "@react-native-firebase/app": "^26.4.0",
     "@react-native-firebase/messaging": "^26.4.0",
     "axios": "^1.20.0",
@@ -47,6 +48,7 @@
     "expo-secure-store": "~57.0.4",
     "expo-sharing": "~57.0.24",
     "expo-splash-screen": "~57.0.10",
+    "expo-sqlite": "~57.0.4",
     "expo-status-bar": "~57.0.1",
     "expo-symbols": "~57.0.3",
     "expo-system-ui": "~57.0.4",
@@ -78,6 +80,8 @@
   "build": {
     "appId": "com.keerthi2693.mytodoapp",
     "productName": "MyTodoApp",
+    "npmRebuild": false,
+    "buildDependenciesFromSource": false,
     "directories": {
       "output": "release"
     },

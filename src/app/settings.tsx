@@ -2,8 +2,6 @@ import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  Keyboard,
-  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
@@ -13,8 +11,8 @@ import {
   Switch,
   Text,
   TextInput,
-  TouchableWithoutFeedback,
   View,
+  useWindowDimensions,
 } from "react-native";
 
 import * as Contacts from "expo-contacts/legacy";
@@ -82,6 +80,9 @@ const STORAGE = {
 };
 export default function AppSettingsScreen() {
   const { theme, setTheme, colors, isDark } = useAppTheme();
+  const { width: windowWidth } = useWindowDimensions();
+  const isDesktop = Platform.OS === "web" && windowWidth >= 1024;
+  const isLargeDesktop = Platform.OS === "web" && windowWidth >= 1440;
   const [loading, setLoading] = useState(true);
   const [widgetTheme, setWidgetTheme] = useState<ChecklistWidgetTheme>("mint");
   const [widgetThemeBusy, setWidgetThemeBusy] = useState(false);
@@ -114,21 +115,31 @@ export default function AppSettingsScreen() {
   const [feedbackMessage, setFeedbackMessage] = useState("");
   const [feedbackEmail, setFeedbackEmail] = useState("");
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [logoutModalVisible, setLogoutModalVisible] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
 
   const SUPPORT_EMAIL = "your-support-email@example.com";
   // Replace this with your actual support email address.
+
+  const showFeedbackAlert = (title: string, message: string) => {
+    if (Platform.OS === "web") {
+      window.alert(`${title}\n\n${message}`);
+    } else {
+      Alert.alert(title, message);
+    }
+  };
 
   const sendFeedback = async () => {
     const message = feedbackMessage.trim();
     const email = feedbackEmail.trim();
 
     if (!message) {
-      Alert.alert("Message required", "Please enter your feedback.");
+      showFeedbackAlert("Message required", "Please enter your feedback.");
       return;
     }
 
     if (message.length > 3000) {
-      Alert.alert(
+      showFeedbackAlert(
         "Message too long",
         "Feedback must be 3000 characters or fewer.",
       );
@@ -136,18 +147,22 @@ export default function AppSettingsScreen() {
     }
 
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      Alert.alert("Invalid email", "Please enter a valid email address.");
+      showFeedbackAlert("Invalid email", "Please enter a valid email address.");
       return;
     }
+
+    if (feedbackSubmitting) return;
 
     try {
       setFeedbackSubmitting(true);
 
-      // Use the token key already used by your login/authentication code.
       const token = await AsyncStorage.getItem("login_token");
 
       if (!token) {
-        Alert.alert("Login required", "Please log in to submit feedback.");
+        showFeedbackAlert(
+          "Login required",
+          "Please log in to submit feedback.",
+        );
         return;
       }
 
@@ -172,12 +187,12 @@ export default function AppSettingsScreen() {
         setFeedbackEmail("");
         setFeedbackType("Suggestion");
 
-        Alert.alert(
+        showFeedbackAlert(
           "Thank you!",
           "Your feedback has been submitted successfully.",
         );
       } else {
-        Alert.alert(
+        showFeedbackAlert(
           "Submission failed",
           response.data?.error || "Unable to submit feedback.",
         );
@@ -188,7 +203,7 @@ export default function AppSettingsScreen() {
         error?.response?.data || error?.message || error,
       );
 
-      Alert.alert(
+      showFeedbackAlert(
         "Submission failed",
         error?.response?.data?.error ||
           "Could not submit feedback. Please check your connection and try again.",
@@ -674,46 +689,63 @@ export default function AppSettingsScreen() {
     await savePreference(key, String(value), label);
   };
 
-  const showInfo = (title: string, message: string) =>
-    Alert.alert(title, message);
+  const showInfo = (title: string, message: string) => {
+    if (Platform.OS === "web") {
+      window.alert(`${title}\n\n${message}`);
+    } else {
+      Alert.alert(title, message);
+    }
+  };
 
   const handleLogout = () => {
-    Alert.alert(
-      "Log out?",
-      "Are you sure you want to log out of your account?",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Log out",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              // Remove session/auth data while preserving app preferences.
-              await AsyncStorage.multiRemove([
-                "userId",
-                "userid",
-                "currentUserId",
-                "login_token",
-                "token",
-                "authToken",
-                "userEmail",
-                "userName",
-                "fcmToken",
-                "fcmUserId",
-              ]);
-            } catch (error) {
-              console.error("Logout storage cleanup failed:", error);
-              Alert.alert(
-                "Logout failed",
-                "Could not clear your session. Please try again.",
-              );
-              return;
-            }
-            router.replace("/loginscreen");
-          },
-        },
-      ],
-    );
+    // Use an in-app modal because Alert.alert() is not supported reliably
+    // by React Native Web when running inside Electron.
+    setLogoutModalVisible(true);
+  };
+
+  const cancelLogout = () => {
+    if (!isLoggingOut) {
+      setLogoutModalVisible(false);
+    }
+  };
+
+  const confirmLogout = async () => {
+    if (isLoggingOut) return;
+
+    setIsLoggingOut(true);
+
+    try {
+      // Remove session/auth data while preserving app preferences and user data.
+      await AsyncStorage.multiRemove([
+        "userId",
+        "userid",
+        "currentUserId",
+        "login_token",
+        "token",
+        "authToken",
+        "userEmail",
+        "userName",
+        "isLoggedIn",
+        "offlineMode",
+        "offlineUserId",
+        "offlineUserEmail",
+        "offlineUserName",
+        "fcmToken",
+        "fcmUserId",
+      ]);
+
+      setLogoutModalVisible(false);
+      router.replace("/loginscreen");
+    } catch (error) {
+      console.error("Logout storage cleanup failed:", error);
+      setLogoutModalVisible(false);
+      showInfo(
+        "Logout failed",
+        "Could not clear your session. Please try again.",
+      );
+    } finally {
+      setIsLoggingOut(false);
+    }
   };
 
   const SettingRow = ({
@@ -853,7 +885,11 @@ export default function AppSettingsScreen() {
 
   return (
     <SafeAreaView
-      style={[styles.safeArea, { backgroundColor: colors.background }]}
+      style={[
+        styles.safeArea,
+        isDesktop && styles.desktopSafeArea,
+        { backgroundColor: colors.background },
+      ]}
       edges={["top", "left", "right"]}
     >
       <StatusBar
@@ -861,47 +897,70 @@ export default function AppSettingsScreen() {
         backgroundColor={colors.background}
       />
       <ScrollView
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={[
+          styles.scrollContent,
+          isDesktop && styles.desktopScrollContent,
+        ]}
         showsVerticalScrollIndicator={false}
       >
-        <View style={styles.header}>
-          <Pressable
-            onPress={() => router.back()}
-            style={styles.backButton}
-            accessibilityLabel="Go back"
-          >
-            <Ionicons name="arrow-back" size={22} color={colors.text} />
-          </Pressable>
-          <View style={styles.headerCopy}>
-            <Text style={styles.eyebrow}>PREFERENCES</Text>
-            <Text style={[styles.headerTitle, { color: colors.text }]}>
-              App settings
-            </Text>
-            <Text
-              style={[styles.headerSubtitle, { color: colors.secondaryText }]}
-            >
-              Make your workspace feel like yours.
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.headerMark,
-              {
-                backgroundColor: isDark ? colors.surface : COLORS.primaryLight,
-              },
-            ]}
-          >
-            <Ionicons
-              name="options-outline"
-              size={23}
-              color={COLORS.primaryDark}
-            />
-          </View>
-        </View>
+       <View style={[styles.header, isDesktop && styles.desktopHeader]}>
+  <Pressable
+    onPress={() => router.back()}
+    style={[
+      styles.backButton,
+      isDesktop && styles.desktopBackButton,
+      {
+        backgroundColor: isDark ? "#26332E" : "#F1F5F9",
+        borderColor: isDark ? "#3D5148" : "#E2E8F0",
+        borderWidth: 1,
+      },
+    ]}
+    accessibilityRole="button"
+    accessibilityLabel="Go back"
+  >
+    <Ionicons
+      name="arrow-back"
+      size={22}
+      color={isDark ? "#FFFFFF" : "#1F2937"}
+    />
+  </Pressable>
+
+  <View
+    style={[styles.headerCopy, isDesktop && styles.desktopHeaderCopy]}
+  >
+    <Text style={[styles.eyebrow, isDesktop && styles.desktopEyebrow]}>
+      PREFERENCES
+    </Text>
+
+    <Text
+      style={[
+        styles.headerTitle,
+        isDesktop && styles.desktopHeaderTitle,
+        { color: colors.text },
+      ]}
+    >
+      App settings
+    </Text>
+
+    <Text
+      style={[
+        styles.headerSubtitle,
+        isDesktop && styles.desktopHeaderSubtitle,
+        { color: colors.secondaryText },
+      ]}
+    >
+      Make your workspace feel like yours.
+    </Text>
+  </View>
+</View>
 
         <LinearGradient
           colors={isDark ? ["#203B32", "#172A24"] : ["#DDF6EC", "#F0FAF5"]}
-          style={styles.heroCard}
+          style={[
+            styles.heroCard,
+            isDesktop && styles.desktopHeroCard,
+            isLargeDesktop && styles.desktopHeroCardLarge,
+          ]}
         >
           <View style={styles.heroText}>
             <Text
@@ -932,12 +991,19 @@ export default function AppSettingsScreen() {
           <View style={styles.heroDecoration} />
         </LinearGradient>
 
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>
+        <Text
+          style={[
+            styles.sectionHeading,
+            isDesktop && styles.desktopSectionHeading,
+            { color: colors.text },
+          ]}
+        >
           Appearance
         </Text>
         <View
           style={[
             styles.sectionCard,
+            isDesktop && styles.desktopSectionCard,
             { backgroundColor: colors.surface, borderColor: colors.border },
           ]}
         >
@@ -959,182 +1025,19 @@ export default function AppSettingsScreen() {
           />
         </View>
 
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>
-          Home-screen checklist widget
-        </Text>
-        <View
+        <Text
           style={[
-            styles.sectionCard,
-            {
-              backgroundColor: colors.surface,
-              borderColor: colors.border,
-              paddingVertical: 16,
-            },
+            styles.sectionHeading,
+            isDesktop && styles.desktopSectionHeading,
+            { color: colors.text },
           ]}
         >
-          <Text
-            style={{
-              color: colors.text,
-              fontSize: 14,
-              fontWeight: "700",
-              marginBottom: 5,
-            }}
-          >
-            Widget theme
-          </Text>
-          <Text
-            style={{
-              color: colors.secondaryText,
-              fontSize: 12,
-              lineHeight: 18,
-              marginBottom: 14,
-            }}
-          >
-            Choose how the checklist widget looks on your Android home screen.
-          </Text>
-
-          <View style={{ flexDirection: "row", gap: 9 }}>
-            {(
-              [
-                {
-                  id: "mint",
-                  label: "Mint Green",
-                  background: "#F0F8F4",
-                  foreground: "#245C48",
-                  accent: "#245C48",
-                },
-                {
-                  id: "light",
-                  label: "Light",
-                  background: "#FFFFFF",
-                  foreground: "#202124",
-                  accent: "#256D5A",
-                },
-                {
-                  id: "dark",
-                  label: "Dark",
-                  background: "#202124",
-                  foreground: "#FFFFFF",
-                  accent: "#A7E3D0",
-                },
-              ] as {
-                id: ChecklistWidgetTheme;
-                label: string;
-                background: string;
-                foreground: string;
-                accent: string;
-              }[]
-            ).map((option) => {
-              const selected = widgetTheme === option.id;
-              return (
-                <Pressable
-                  key={option.id}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected }}
-                  disabled={widgetThemeBusy}
-                  onPress={() => void handleWidgetThemeChange(option.id)}
-                  style={({ pressed }) => ({
-                    flex: 1,
-                    minHeight: 92,
-                    padding: 9,
-                    borderRadius: 14,
-                    borderWidth: selected ? 2 : 1,
-                    borderColor: selected ? colors.primary : colors.border,
-                    backgroundColor: option.background,
-                    alignItems: "center",
-                    justifyContent: "center",
-                    opacity: pressed || widgetThemeBusy ? 0.75 : 1,
-                  })}
-                >
-                  <View
-                    style={{
-                      width: 35,
-                      height: 35,
-                      borderRadius: 11,
-                      backgroundColor: option.accent,
-                      alignItems: "center",
-                      justifyContent: "center",
-                      marginBottom: 7,
-                    }}
-                  >
-                    <Ionicons
-                      name={selected ? "checkmark" : "list-outline"}
-                      size={19}
-                      color={option.id === "dark" ? "#202124" : "#FFFFFF"}
-                    />
-                  </View>
-                  <Text
-                    style={{
-                      color: option.foreground,
-                      fontSize: 11,
-                      fontWeight: selected ? "800" : "600",
-                      textAlign: "center",
-                    }}
-                  >
-                    {option.label}
-                  </Text>
-                  {selected && (
-                    <Text
-                      style={{
-                        color: option.foreground,
-                        fontSize: 9,
-                        marginTop: 3,
-                      }}
-                    >
-                      Selected
-                    </Text>
-                  )}
-                </Pressable>
-              );
-            })}
-          </View>
-
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Refresh home-screen checklist widget"
-            disabled={widgetThemeBusy}
-            onPress={() => void handleRefreshChecklistWidget()}
-            style={({ pressed }) => ({
-              marginTop: 13,
-              minHeight: 46,
-              borderRadius: 13,
-              backgroundColor: colors.primary,
-              flexDirection: "row",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 8,
-              opacity: pressed || widgetThemeBusy ? 0.75 : 1,
-            })}
-          >
-            {widgetThemeBusy ? (
-              <ActivityIndicator size="small" color="#FFFFFF" />
-            ) : (
-              <Ionicons name="refresh-outline" size={18} color="#FFFFFF" />
-            )}
-            <Text style={{ color: "#FFFFFF", fontSize: 13, fontWeight: "700" }}>
-              {widgetThemeBusy ? "Updating widget…" : "Refresh widget"}
-            </Text>
-          </Pressable>
-          <Text
-            style={{
-              color: colors.secondaryText,
-              fontSize: 11,
-              lineHeight: 16,
-              marginTop: 10,
-            }}
-          >
-            If the widget does not change, remove it from your Android home
-            screen and add it again. Native widget changes require a rebuilt
-            Android app; Expo Go does not load custom native modules.
-          </Text>
-        </View>
-
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>
           Notifications
         </Text>
         <View
           style={[
             styles.sectionCard,
+            isDesktop && styles.desktopSectionCard,
             { backgroundColor: colors.surface, borderColor: colors.border },
           ]}
         >
@@ -1170,18 +1073,31 @@ export default function AppSettingsScreen() {
             last
           />
         </View>
-        <Text style={[styles.helperText, { color: colors.secondaryText }]}>
+        <Text
+          style={[
+            styles.helperText,
+            isDesktop && styles.desktopHelperText,
+            { color: colors.secondaryText },
+          ]}
+        >
           These switches save your preferences on this device. Connect them to
           your notification and reminder scheduling logic to enforce them
           app-wide.
         </Text>
 
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>
+        <Text
+          style={[
+            styles.sectionHeading,
+            isDesktop && styles.desktopSectionHeading,
+            { color: colors.text },
+          ]}
+        >
           Backup & sync
         </Text>
         <View
           style={[
             styles.sectionCard,
+            isDesktop && styles.desktopSectionCard,
             { backgroundColor: colors.surface, borderColor: colors.border },
           ]}
         >
@@ -1269,7 +1185,13 @@ export default function AppSettingsScreen() {
             last
           />
         </View>
-        <Text style={[styles.helperText, { color: colors.secondaryText }]}>
+        <Text
+          style={[
+            styles.helperText,
+            isDesktop && styles.desktopHelperText,
+            { color: colors.secondaryText },
+          ]}
+        >
           Backup status:{" "}
           {lastBackupAt
             ? `Last local backup/restore ${new Date(lastBackupAt).toLocaleString()}`
@@ -1279,12 +1201,19 @@ export default function AppSettingsScreen() {
           downloaded by this local export.
         </Text>
 
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>
+        <Text
+          style={[
+            styles.sectionHeading,
+            isDesktop && styles.desktopSectionHeading,
+            { color: colors.text },
+          ]}
+        >
           Experience
         </Text>
         <View
           style={[
             styles.sectionCard,
+            isDesktop && styles.desktopSectionCard,
             { backgroundColor: colors.surface, borderColor: colors.border },
           ]}
         >
@@ -1298,12 +1227,19 @@ export default function AppSettingsScreen() {
           />
         </View>
 
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>
+        <Text
+          style={[
+            styles.sectionHeading,
+            isDesktop && styles.desktopSectionHeading,
+            { color: colors.text },
+          ]}
+        >
           Support & information
         </Text>
         <View
           style={[
             styles.sectionCard,
+            isDesktop && styles.desktopSectionCard,
             { backgroundColor: colors.surface, borderColor: colors.border },
           ]}
         >
@@ -1334,49 +1270,22 @@ export default function AppSettingsScreen() {
           />
         </View>
 
-        <Text style={[styles.sectionHeading, { color: colors.text }]}>
+        <Text
+          style={[
+            styles.sectionHeading,
+            isDesktop && styles.desktopSectionHeading,
+            { color: colors.text },
+          ]}
+        >
           Account
         </Text>
         <View
           style={[
             styles.sectionCard,
+            isDesktop && styles.desktopSectionCard,
             { backgroundColor: colors.surface, borderColor: colors.border },
           ]}
         >
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Import contact details"
-            onPress={importContactDetails}
-            style={({ pressed }) => [
-              styles.importContactButton,
-              pressed && styles.pressed,
-            ]}
-          >
-            <View style={styles.importContactIcon}>
-              <Ionicons
-                name="people-outline"
-                size={20}
-                color={colors.primary}
-              />
-            </View>
-            <View style={styles.importContactCopy}>
-              <Text
-                style={[styles.importContactButtonText, { color: colors.text }]}
-              >
-                Import Contact Details
-              </Text>
-              <Text
-                style={[styles.rowSubtitle, { color: colors.secondaryText }]}
-              >
-                View names, phone numbers and email addresses
-              </Text>
-            </View>
-            <Ionicons
-              name="chevron-forward"
-              size={18}
-              color={colors.secondaryText}
-            />
-          </Pressable>
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Log out"
@@ -1403,10 +1312,148 @@ export default function AppSettingsScreen() {
           </Pressable>
         </View>
 
-        <Text style={[styles.footer, { color: colors.secondaryText }]}>
+        <Text
+          style={[
+            styles.footer,
+            isDesktop && styles.desktopFooter,
+            { color: colors.secondaryText },
+          ]}
+        >
           Made for your everyday ideas and tasks.
         </Text>
       </ScrollView>
+
+      {/* Cross-platform logout confirmation (including Electron Desktop). */}
+      <Modal
+        visible={logoutModalVisible}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={cancelLogout}
+      >
+        <View
+          style={{
+            flex: 1,
+            backgroundColor: "rgba(0, 0, 0, 0.48)",
+            justifyContent: "center",
+            alignItems: "center",
+            padding: 20,
+          }}
+        >
+          <Pressable
+            style={{
+              position: "absolute",
+              top: 0,
+              right: 0,
+              bottom: 0,
+              left: 0,
+            }}
+            onPress={cancelLogout}
+            disabled={isLoggingOut}
+            accessibilityRole="button"
+            accessibilityLabel="Close logout confirmation"
+          />
+
+          <View
+            style={{
+              width: "100%",
+              maxWidth: 380,
+              backgroundColor: colors.surface,
+              borderRadius: 18,
+              borderWidth: 1,
+              borderColor: colors.border,
+              padding: 24,
+              elevation: 12,
+              shadowColor: "#000",
+              shadowOpacity: 0.2,
+              shadowRadius: 20,
+              shadowOffset: { width: 0, height: 8 },
+            }}
+          >
+            <View
+              style={{
+                width: 48,
+                height: 48,
+                borderRadius: 24,
+                backgroundColor: "#FDECEC",
+                alignItems: "center",
+                justifyContent: "center",
+                marginBottom: 16,
+              }}
+            >
+              <Ionicons name="log-out-outline" size={24} color="#C83E4D" />
+            </View>
+
+            <Text
+              style={{
+                color: colors.text,
+                fontSize: 20,
+                fontWeight: "700",
+              }}
+            >
+              Log out?
+            </Text>
+
+            <Text
+              style={{
+                color: colors.secondaryText,
+                fontSize: 14,
+                lineHeight: 22,
+                marginTop: 10,
+                marginBottom: 24,
+              }}
+            >
+              Are you sure you want to log out of your account?
+            </Text>
+
+            <View
+              style={{
+                flexDirection: "row",
+                justifyContent: "flex-end",
+                alignItems: "center",
+                gap: 12,
+              }}
+            >
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Cancel logout"
+                disabled={isLoggingOut}
+                onPress={cancelLogout}
+                style={({ pressed }) => ({
+                  paddingVertical: 11,
+                  paddingHorizontal: 18,
+                  borderRadius: 9,
+                  borderWidth: 1,
+                  borderColor: colors.border,
+                  opacity: pressed ? 0.7 : 1,
+                })}
+              >
+                <Text style={{ color: colors.text, fontWeight: "600" }}>
+                  Cancel
+                </Text>
+              </Pressable>
+
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Confirm logout"
+                disabled={isLoggingOut}
+                onPress={confirmLogout}
+                style={({ pressed }) => ({
+                  paddingVertical: 11,
+                  paddingHorizontal: 18,
+                  borderRadius: 9,
+                  backgroundColor: "#C83E4D",
+                  opacity: isLoggingOut ? 0.6 : pressed ? 0.85 : 1,
+                })}
+              >
+                <Text style={{ color: "#FFFFFF", fontWeight: "600" }}>
+                  {isLoggingOut ? "Logging out..." : "Log out"}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       <Modal
         transparent
@@ -1802,48 +1849,7 @@ export default function AppSettingsScreen() {
                 })}
               </View>
 
-              <Text style={styles.noteThemeSectionTitle}>
-                Custom paper color
-              </Text>
-              <View style={styles.customColorRow}>
-                <View
-                  style={[
-                    styles.customColorSwatch,
-                    {
-                      backgroundColor: /^#[0-9A-Fa-f]{6}$/.test(customNoteColor)
-                        ? customNoteColor
-                        : defaultNoteColor,
-                    },
-                  ]}
-                />
-                <TextInput
-                  value={customNoteColor}
-                  onChangeText={(value) => {
-                    setCustomNoteColor(value);
-                    if (/^#[0-9A-Fa-f]{6}$/.test(value))
-                      setDefaultNoteColor(value);
-                  }}
-                  placeholder="#FFF4CC"
-                  autoCapitalize="characters"
-                  maxLength={7}
-                  style={styles.customColorInput}
-                  accessibilityLabel="Custom note color hex value"
-                />
-                <Pressable
-                  style={styles.applyColorButton}
-                  onPress={() => {
-                    if (/^#[0-9A-Fa-f]{6}$/.test(customNoteColor))
-                      setDefaultNoteColor(customNoteColor);
-                    else
-                      Alert.alert(
-                        "Invalid color",
-                        "Enter a hex color like #FFF4CC.",
-                      );
-                  }}
-                >
-                  <Text style={styles.applyColorText}>Apply</Text>
-                </Pressable>
-              </View>
+              
 
               <Text style={styles.noteThemeSectionTitle}>App accent color</Text>
               <View style={styles.accentPalette}>
@@ -2217,183 +2223,185 @@ export default function AppSettingsScreen() {
       <Modal
         visible={feedbackModalVisible}
         transparent
-        animationType="slide"
-        statusBarTranslucent
-        onRequestClose={() => {
-          Keyboard.dismiss();
-          setFeedbackModalVisible(false);
-        }}
+        animationType={Platform.OS === "web" ? "fade" : "slide"}
+        onRequestClose={() => setFeedbackModalVisible(false)}
       >
         <View style={styles.overlay}>
-          <KeyboardAvoidingView
-            style={styles.feedbackKeyboard}
-            behavior={Platform.OS === "ios" ? "padding" : "height"}
-            keyboardVerticalOffset={Platform.OS === "ios" ? 20 : 0}
+          <View
+            style={[
+              styles.feedbackKeyboardInner,
+              Platform.OS === "web" && styles.webFeedbackContainer,
+            ]}
           >
-            <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-              <View style={styles.feedbackKeyboardInner}>
-                <View
-                  style={[styles.modal, { backgroundColor: colors.surface }]}
-                >
-                  <ScrollView
-                    style={styles.feedbackScroll}
-                    contentContainerStyle={styles.feedbackScrollContent}
-                    keyboardShouldPersistTaps="handled"
-                    keyboardDismissMode={
-                      Platform.OS === "ios" ? "interactive" : "on-drag"
-                    }
-                    showsVerticalScrollIndicator={false}
-                    nestedScrollEnabled
-                  >
-                    <View style={styles.feedbackHeader}>
-                      <View style={styles.headingGroup}>
-                        <View style={styles.iconCircle}>
-                          <Ionicons
-                            name="chatbubble-ellipses-outline"
-                            size={24}
-                            color={COLORS.blue}
-                          />
-                        </View>
+            <View style={[styles.modal, { backgroundColor: colors.surface }]}>
+              <ScrollView
+                style={styles.feedbackScroll}
+                contentContainerStyle={styles.feedbackScrollContent}
+                keyboardShouldPersistTaps="always"
+                showsVerticalScrollIndicator={false}
+                nestedScrollEnabled
+              >
+                {/* Header */}
+                <View style={styles.feedbackHeader}>
+                  <View style={styles.headingGroup}>
+                    <View style={styles.iconCircle}>
+                      <Ionicons
+                        name="chatbubble-ellipses-outline"
+                        size={24}
+                        color={COLORS.blue}
+                      />
+                    </View>
 
-                        <View style={styles.feedbackHeadingText}>
-                          <Text style={[styles.title, { color: colors.text }]}>
-                            Send feedback
-                          </Text>
-                          <Text
-                            style={[
-                              styles.subtitle,
-                              { color: colors.textSecondary },
-                            ]}
-                          >
-                            Help us improve your experience
-                          </Text>
-                        </View>
-                      </View>
-
-                      <Pressable
-                        onPress={() => {
-                          Keyboard.dismiss();
-                          setFeedbackModalVisible(false);
-                        }}
-                        hitSlop={10}
-                        accessibilityLabel="Close feedback form"
+                    <View style={styles.feedbackHeadingText}>
+                      <Text style={[styles.title, { color: colors.text }]}>
+                        Send feedback
+                      </Text>
+                      <Text
+                        style={[
+                          styles.subtitle,
+                          { color: colors.textSecondary },
+                        ]}
                       >
-                        <Ionicons
-                          name="close-circle-outline"
-                          size={27}
-                          color={colors.textSecondary}
-                        />
-                      </Pressable>
+                        Help us improve your experience
+                      </Text>
                     </View>
+                  </View>
 
-                    <Text style={[styles.label, { color: colors.text }]}>
-                      Feedback type
-                    </Text>
-
-                    <View style={styles.typeRow}>
-                      {["Suggestion", "Bug report", "Other"].map((type) => {
-                        const selected = feedbackType === type;
-
-                        return (
-                          <Pressable
-                            key={type}
-                            onPress={() => setFeedbackType(type)}
-                            style={[
-                              styles.typeChip,
-                              {
-                                backgroundColor: selected
-                                  ? COLORS.blueLight
-                                  : colors.surface,
-                                borderColor: selected
-                                  ? COLORS.blue
-                                  : colors.border,
-                              },
-                            ]}
-                          >
-                            <Text
-                              style={{
-                                color: selected ? COLORS.blue : colors.text,
-                                fontWeight: selected ? "700" : "500",
-                                fontSize: 12,
-                              }}
-                            >
-                              {type}
-                            </Text>
-                          </Pressable>
-                        );
-                      })}
-                    </View>
-
-                    <Text style={[styles.label, { color: colors.text }]}>
-                      Your message *
-                    </Text>
-
-                    <TextInput
-                      value={feedbackMessage}
-                      onChangeText={setFeedbackMessage}
-                      placeholder="Tell us what you think or what we can improve..."
-                      placeholderTextColor={colors.textSecondary}
-                      multiline
-                      textAlignVertical="top"
-                      maxLength={3000}
-                      style={[
-                        styles.messageInput,
-                        {
-                          color: colors.text,
-                          backgroundColor: colors.background,
-                          borderColor: colors.border,
-                        },
-                      ]}
+                  <Pressable
+                    onPress={() => setFeedbackModalVisible(false)}
+                    hitSlop={10}
+                    accessibilityLabel="Close feedback form"
+                  >
+                    <Ionicons
+                      name="close-circle-outline"
+                      size={27}
+                      color={colors.textSecondary}
                     />
-
-                    <Text
-                      style={[styles.counter, { color: colors.textSecondary }]}
-                    >
-                      {feedbackMessage.length}/3000
-                    </Text>
-
-                    <Text style={[styles.label, { color: colors.text }]}>
-                      Email address (optional)
-                    </Text>
-
-                    <TextInput
-                      value={feedbackEmail}
-                      onChangeText={setFeedbackEmail}
-                      placeholder="you@example.com"
-                      placeholderTextColor={colors.textSecondary}
-                      keyboardType="email-address"
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                      returnKeyType="done"
-                      onSubmitEditing={Keyboard.dismiss}
-                      style={[
-                        styles.emailInput,
-                        {
-                          color: colors.text,
-                          backgroundColor: colors.background,
-                          borderColor: colors.border,
-                        },
-                      ]}
-                    />
-
-                    <Pressable onPress={sendFeedback} style={styles.sendButton}>
-                      <Ionicons name="send-outline" size={19} color="#FFFFFF" />
-                      <Text style={styles.sendButtonText}>Submit feedback</Text>
-                    </Pressable>
-
-                    <Text
-                      style={[
-                        styles.feedbackFooter,
-                        { color: colors.textSecondary },
-                      ]}
-                    >
-                      Your feedback will be submitted to help improve the app.
-                    </Text>
-                  </ScrollView>
+                  </Pressable>
                 </View>
-              </View>
-            </TouchableWithoutFeedback>
-          </KeyboardAvoidingView>
+
+                {/* Feedback type */}
+                <Text style={[styles.label, { color: colors.text }]}>
+                  Feedback type
+                </Text>
+
+                <View style={styles.typeRow}>
+                  {["Suggestion", "Bug report", "Other"].map((type) => {
+                    const selected = feedbackType === type;
+
+                    return (
+                      <Pressable
+                        key={type}
+                        onPress={() => setFeedbackType(type)}
+                        style={[
+                          styles.typeChip,
+                          {
+                            backgroundColor: selected
+                              ? COLORS.blueLight
+                              : colors.surface,
+                            borderColor: selected ? COLORS.blue : colors.border,
+                          },
+                        ]}
+                      >
+                        <Text
+                          style={{
+                            color: selected ? COLORS.blue : colors.text,
+                            fontWeight: selected ? "700" : "500",
+                            fontSize: 12,
+                          }}
+                        >
+                          {type}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+
+                {/* Message */}
+                <Text style={[styles.label, { color: colors.text }]}>
+                  Your message *
+                </Text>
+
+                <TextInput
+                  value={feedbackMessage}
+                  onChangeText={setFeedbackMessage}
+                  placeholder="Tell us what you think or what we can improve..."
+                  placeholderTextColor={colors.textSecondary}
+                  multiline
+                  editable
+                  maxLength={3000}
+                  textAlignVertical="top"
+                  style={[
+                    styles.messageInput,
+                    {
+                      color: colors.text,
+                      backgroundColor: colors.background,
+                      borderColor: colors.border,
+                    },
+                    Platform.OS === "web" && styles.webTextInput,
+                  ]}
+                />
+
+                <Text style={[styles.counter, { color: colors.textSecondary }]}>
+                  {feedbackMessage.length}/3000
+                </Text>
+
+                {/* Email */}
+                <Text style={[styles.label, { color: colors.text }]}>
+                  Email address (optional)
+                </Text>
+
+                <TextInput
+                  value={feedbackEmail}
+                  onChangeText={setFeedbackEmail}
+                  placeholder="you@example.com"
+                  placeholderTextColor={colors.textSecondary}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  editable
+                  style={[
+                    styles.emailInput,
+                    {
+                      color: colors.text,
+                      backgroundColor: colors.background,
+                      borderColor: colors.border,
+                    },
+                    Platform.OS === "web" && styles.webTextInput,
+                  ]}
+                />
+
+                {/* Submit */}
+                <Pressable
+                  onPress={sendFeedback}
+                  disabled={feedbackSubmitting}
+                  style={[
+                    styles.sendButton,
+                    { opacity: feedbackSubmitting ? 0.6 : 1 },
+                  ]}
+                >
+                  {feedbackSubmitting ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Ionicons name="send-outline" size={19} color="#FFFFFF" />
+                  )}
+
+                  <Text style={styles.sendButtonText}>
+                    {feedbackSubmitting ? "Submitting..." : "Submit feedback"}
+                  </Text>
+                </Pressable>
+
+                <Text
+                  style={[
+                    styles.feedbackFooter,
+                    { color: colors.textSecondary },
+                  ]}
+                >
+                  Your feedback will be submitted to help improve the app.
+                </Text>
+              </ScrollView>
+            </View>
+          </View>
         </View>
       </Modal>
     </SafeAreaView>
@@ -2401,6 +2409,60 @@ export default function AppSettingsScreen() {
 }
 
 const styles = StyleSheet.create({
+  feedbackKeyboardInner: {
+    width: "100%",
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 16,
+  },
+
+  webFeedbackContainer: {
+    height: "100vh" as any,
+    overflow: "auto" as any,
+  },
+
+  feedbackScroll: {
+    width: "100%",
+  },
+
+  feedbackScrollContent: {
+    padding: 20,
+    paddingBottom: 30,
+  },
+
+  webTextInput: {
+    outlineStyle: "none" as any,
+    cursor: "text" as any,
+    userSelect: "text" as any,
+    pointerEvents: "auto" as any,
+  },
+
+  messageInput: {
+    minHeight: 120,
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    fontSize: 15,
+    textAlignVertical: "top",
+  },
+
+  emailInput: {
+    minHeight: 48,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    fontSize: 15,
+  },
+
+  modal: {
+    width: "100%",
+    maxWidth: 550,
+    maxHeight: "85%",
+    borderRadius: 20,
+    overflow: "hidden",
+  },
+
   liveNotePreview: {
     minHeight: 150,
     padding: 16,
@@ -2419,24 +2481,6 @@ const styles = StyleSheet.create({
     flex: 1,
     width: "100%",
     justifyContent: "center",
-  },
-
-  feedbackKeyboardInner: {
-    flex: 1,
-    width: "100%",
-    justifyContent: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-
-  feedbackScroll: {
-    flexGrow: 0,
-    width: "100%",
-    maxHeight: "100%",
-  },
-
-  feedbackScrollContent: {
-    paddingBottom: 20,
   },
 
   feedbackHeadingText: {
@@ -2463,11 +2507,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     padding: 18,
   },
-  modal: {
-    borderRadius: 24,
-    padding: 22,
-    maxHeight: "90%",
-  },
+
   feedbackHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -2512,28 +2552,13 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 13,
   },
-  messageInput: {
-    minHeight: 135,
-    maxHeight: 200,
-    borderWidth: 1,
-    borderRadius: 14,
-    padding: 14,
-    fontSize: 14,
-    marginBottom: 5,
-  },
+
   counter: {
     textAlign: "right",
     fontSize: 11,
     marginBottom: 18,
   },
-  emailInput: {
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 14,
-    marginBottom: 20,
-  },
+
   sendButton: {
     backgroundColor: COLORS.primary,
     borderRadius: 14,
@@ -2542,6 +2567,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 9,
+    marginTop: 20,
   },
   sendButtonText: {
     color: "#FFFFFF",
@@ -2897,6 +2923,105 @@ const styles = StyleSheet.create({
   },
   importContactCopy: { flex: 1 },
   importContactButtonText: { fontSize: 14, fontWeight: "700" },
+  desktopSafeArea: {
+    alignItems: "center",
+  },
+  desktopScrollContent: {
+    width: "100%",
+    alignItems: "center",
+    paddingHorizontal: 42,
+    paddingTop: 34,
+    paddingBottom: 64,
+  },
+  desktopHeader: {
+    width: "100%",
+    maxWidth: 1120,
+    marginBottom: 30,
+    gap: 18,
+  },
+  desktopBackButton: {
+    width: 48,
+    height: 48,
+    borderRadius: 16,
+  },
+  desktopHeaderCopy: {
+    paddingVertical: 2,
+  },
+  desktopEyebrow: {
+    fontSize: 11,
+    letterSpacing: 2.2,
+    marginBottom: 7,
+  },
+  desktopHeaderTitle: {
+    fontSize: 34,
+    letterSpacing: -1.1,
+  },
+  desktopHeaderSubtitle: {
+    fontSize: 14,
+    marginTop: 6,
+  },
+  desktopHeaderMark: {
+    width: 54,
+    height: 54,
+    borderRadius: 18,
+  },
+  desktopHeroCard: {
+    width: "100%",
+    maxWidth: 1120,
+    minHeight: 178,
+    paddingHorizontal: 34,
+    paddingVertical: 30,
+    borderRadius: 28,
+    marginBottom: 34,
+  },
+  desktopHeroCardLarge: {
+    minHeight: 194,
+    paddingHorizontal: 42,
+  },
+  desktopHeroTitle: {
+    fontSize: 25,
+    lineHeight: 32,
+    maxWidth: 420,
+  },
+  desktopHeroSubtitle: {
+    fontSize: 14,
+    lineHeight: 22,
+    maxWidth: 500,
+    marginTop: 10,
+  },
+  desktopSectionHeading: {
+    width: "100%",
+    maxWidth: 1120,
+    fontSize: 15,
+    letterSpacing: 0.5,
+    marginBottom: 13,
+    marginTop: 8,
+    marginLeft: 0,
+  },
+  desktopSectionCard: {
+    width: "100%",
+    maxWidth: 1120,
+    borderRadius: 20,
+    paddingHorizontal: 24,
+    marginBottom: 28,
+    shadowOpacity: 0.035,
+    shadowRadius: 12,
+  },
+  desktopHelperText: {
+    width: "100%",
+    maxWidth: 1120,
+    fontSize: 12,
+    lineHeight: 19,
+    marginTop: -15,
+    marginBottom: 28,
+    paddingHorizontal: 4,
+  },
+  desktopFooter: {
+    width: "100%",
+    maxWidth: 1120,
+    fontSize: 12,
+    marginTop: 10,
+  },
   safeArea: { flex: 1, backgroundColor: COLORS.background },
   loadingScreen: {
     flex: 1,
@@ -2913,21 +3038,14 @@ const styles = StyleSheet.create({
     marginBottom: 24,
     gap: 12,
   },
-  backButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 16,
-    backgroundColor: COLORS.surface,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    alignItems: "center",
-    justifyContent: "center",
-    shadowColor: "#183B30",
-    shadowOpacity: 0.04,
-    shadowRadius: 7,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 1,
-  },
+ backButton: {
+  width: 42,
+  height: 42,
+  borderRadius: 12,
+  alignItems: "center",
+  justifyContent: "center",
+  marginRight: 12,
+},
   headerCopy: { flex: 1 },
   eyebrow: {
     fontSize: 10,

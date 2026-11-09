@@ -1,6 +1,7 @@
-
-import * as SecureStore from "expo-secure-store";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Crypto from "expo-crypto";
+import * as SecureStore from "expo-secure-store";
+import { Platform } from "react-native";
 
 const CONFIG_KEY = "notes.security.config.v1";
 const LOCKED_NOTES_KEY = "notes.security.locked-ids.v1";
@@ -9,7 +10,6 @@ export type SecurityConfig = {
   pinSalt: string;
   pinHash: string;
 
-  // Pattern lock verifier
   patternSalt: string;
   patternHash: string;
 
@@ -30,9 +30,62 @@ const DEFAULT_CONFIG: SecurityConfig = {
   autoLockEnabled: true,
 };
 
+// =====================================================
+// PLATFORM-AWARE STORAGE
+// Android: Expo SecureStore
+// Electron / Expo Web: AsyncStorage
+// =====================================================
+
+const SecurityStorage = {
+  async getItem(key: string): Promise<string | null> {
+    try {
+      if (Platform.OS === "web") {
+        return await AsyncStorage.getItem(key);
+      }
+
+      return await SecureStore.getItemAsync(key);
+    } catch (error) {
+      console.error("Security storage read failed:", error);
+      throw error;
+    }
+  },
+
+  async setItem(key: string, value: string): Promise<void> {
+    try {
+      if (Platform.OS === "web") {
+        await AsyncStorage.setItem(key, value);
+        return;
+      }
+
+      await SecureStore.setItemAsync(key, value);
+    } catch (error) {
+      console.error("Security storage write failed:", error);
+      throw error;
+    }
+  },
+
+  async removeItem(key: string): Promise<void> {
+    try {
+      if (Platform.OS === "web") {
+        await AsyncStorage.removeItem(key);
+        return;
+      }
+
+      await SecureStore.deleteItemAsync(key);
+    } catch (error) {
+      console.error("Security storage delete failed:", error);
+      throw error;
+    }
+  },
+};
+
+// =====================================================
+// SECURITY CONFIG
+// =====================================================
+
 export async function readSecurityConfig(): Promise<SecurityConfig> {
   try {
-    const raw = await SecureStore.getItemAsync(CONFIG_KEY);
+    const raw = await SecurityStorage.getItem(CONFIG_KEY);
 
     if (!raw) {
       return { ...DEFAULT_CONFIG };
@@ -40,24 +93,29 @@ export async function readSecurityConfig(): Promise<SecurityConfig> {
 
     const parsed = JSON.parse(raw) as Partial<SecurityConfig>;
 
-    // Defaults preserve compatibility with existing saved configurations.
     return {
       ...DEFAULT_CONFIG,
       ...parsed,
+      pinSalt: parsed.pinSalt ?? "",
+      pinHash: parsed.pinHash ?? "",
       patternSalt: parsed.patternSalt ?? "",
       patternHash: parsed.patternHash ?? "",
     };
   } catch (error) {
-    console.warn("Unable to read security settings:", error);
-    return { ...DEFAULT_CONFIG };
+    console.error("Unable to read security settings:", error);
+    throw error;
   }
 }
 
 export async function writeSecurityConfig(
-  config: SecurityConfig
+  config: SecurityConfig,
 ): Promise<void> {
-  await SecureStore.setItemAsync(CONFIG_KEY, JSON.stringify(config));
+  await SecurityStorage.setItem(CONFIG_KEY, JSON.stringify(config));
 }
+
+// =====================================================
+// CRYPTOGRAPHY
+// =====================================================
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -67,24 +125,28 @@ function bytesToHex(bytes: Uint8Array): string {
 
 async function createVerifier(
   value: string,
-  salt?: string
+  salt?: string,
 ): Promise<{ salt: string; hash: string }> {
-  const actualSalt =
-    salt ?? bytesToHex(await Crypto.getRandomBytesAsync(16));
+  const actualSalt = salt ?? bytesToHex(await Crypto.getRandomBytesAsync(16));
 
   const hash = await Crypto.digestStringAsync(
     Crypto.CryptoDigestAlgorithm.SHA256,
-    `${actualSalt}:${value}`
+    `${actualSalt}:${value}`,
   );
 
-  return { salt: actualSalt, hash };
+  return {
+    salt: actualSalt,
+    hash,
+  };
 }
 
-// PIN
+// =====================================================
+// PIN PROTECTION
+// =====================================================
 
 export async function createPinVerifier(
   pin: string,
-  salt?: string
+  salt?: string,
 ): Promise<{ salt: string; hash: string }> {
   return createVerifier(pin, salt);
 }
@@ -92,7 +154,9 @@ export async function createPinVerifier(
 export async function verifyPin(pin: string): Promise<boolean> {
   const config = await readSecurityConfig();
 
-  if (!config.pinHash || !config.pinSalt) return false;
+  if (!config.pinHash || !config.pinSalt) {
+    return false;
+  }
 
   const result = await createPinVerifier(pin, config.pinSalt);
 
@@ -105,6 +169,7 @@ export async function saveNewPin(pin: string): Promise<void> {
   }
 
   const result = await createPinVerifier(pin);
+
   const previous = await readSecurityConfig();
 
   await writeSecurityConfig({
@@ -115,7 +180,9 @@ export async function saveNewPin(pin: string): Promise<void> {
   });
 }
 
-// Pattern lock
+// =====================================================
+// PATTERN LOCK
+// =====================================================
 
 function normalizePattern(pattern: number[]): string {
   if (
@@ -123,24 +190,21 @@ function normalizePattern(pattern: number[]): string {
     pattern.length < 4 ||
     pattern.length > 9 ||
     pattern.some(
-      (point) =>
-        !Number.isInteger(point) || point < 0 || point > 8
+      (point) => !Number.isInteger(point) || point < 0 || point > 8,
     ) ||
     new Set(pattern).size !== pattern.length
   ) {
-    throw new Error(
-      "Draw a pattern using at least 4 different dots."
-    );
+    throw new Error("Draw a pattern using at least 4 different dots.");
   }
 
   return pattern.join("-");
 }
 
-export async function saveNewPattern(
-  pattern: number[]
-): Promise<void> {
+export async function saveNewPattern(pattern: number[]): Promise<void> {
   const normalized = normalizePattern(pattern);
+
   const result = await createVerifier(normalized);
+
   const previous = await readSecurityConfig();
 
   await writeSecurityConfig({
@@ -151,9 +215,7 @@ export async function saveNewPattern(
   });
 }
 
-export async function verifyPattern(
-  pattern: number[]
-): Promise<boolean> {
+export async function verifyPattern(pattern: number[]): Promise<boolean> {
   let normalized: string;
 
   try {
@@ -168,10 +230,7 @@ export async function verifyPattern(
     return false;
   }
 
-  const result = await createVerifier(
-    normalized,
-    config.patternSalt
-  );
+  const result = await createVerifier(normalized, config.patternSalt);
 
   return result.hash === config.patternHash;
 }
@@ -186,28 +245,27 @@ export async function removePattern(): Promise<void> {
   });
 }
 
-// Locked notes
+// =====================================================
+// LOCKED NOTES
+// =====================================================
 
 export async function readLockedNoteIds(): Promise<string[]> {
   try {
-    const raw = await SecureStore.getItemAsync(LOCKED_NOTES_KEY);
+    const raw = await SecurityStorage.getItem(LOCKED_NOTES_KEY);
+
     const parsed: unknown = raw ? JSON.parse(raw) : [];
 
     return Array.isArray(parsed)
-      ? parsed.filter(
-          (id): id is string => typeof id === "string"
-        )
+      ? parsed.filter((id): id is string => typeof id === "string")
       : [];
-  } catch {
-    return [];
+  } catch (error) {
+    console.error("Unable to read locked notes:", error);
+    throw error;
   }
 }
 
-export async function writeLockedNoteIds(
-  ids: string[]
-): Promise<void> {
-  await SecureStore.setItemAsync(
-    LOCKED_NOTES_KEY,
-    JSON.stringify([...new Set(ids)])
-  );
+export async function writeLockedNoteIds(ids: string[]): Promise<void> {
+  const uniqueIds = [...new Set(ids)];
+
+  await SecurityStorage.setItem(LOCKED_NOTES_KEY, JSON.stringify(uniqueIds));
 }

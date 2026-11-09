@@ -11,8 +11,8 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
-import { router } from "expo-router";
-import { useMemo, useState } from "react";
+import { router, useLocalSearchParams } from "expo-router";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Image,
@@ -372,7 +372,10 @@ function ImageSwatch({ onPress, primary = BRAND, isDark = false }) {
       onPress={onPress}
       style={[
         styles.imageSwatch,
-        { backgroundColor: isDark ? "#26332E" : "#ECEDF2" },
+        {
+          backgroundColor: isDark ? "#26332E" : "#ECEDF2",
+          borderColor: isDark ? "#405A4B" : "rgba(127,160,142,0.25)",
+        },
       ]}
     >
       <Ionicons name="image" size={26} color={primary} />
@@ -390,11 +393,15 @@ export default function CreateQuickNote({
   onCreate,
   // Android emulator: 10.0.2.2 = your computer. Real phone: use your computer's LAN IP or your server URL
   apiUrl = "https://todolistbackend-855c.onrender.com/api/createTodolist",
+  // Edit endpoint is assumed to be PUT /api/updateTodolist/:id.
+  // Change this prop if your backend uses a different update route.
+  updateApiUrl = "https://todolistbackend-855c.onrender.com/api/updateTodolist",
   noteType = "quick", // "quick" | "todo"
   recurring = "none", // "none" | "daily" | "weekly" | "monthly" | "yearly"
   authToken,
 }) {
   const { width } = useWindowDimensions();
+  const isDesktop = Platform.OS === "web" && width >= 1000;
   const { isDark, colors: appTheme } = useAppTheme();
   // Prevent the app-level security listener from treating the system photo picker
   // as a real app exit. These methods must also exist in SecurityProvider.
@@ -408,18 +415,111 @@ export default function CreateQuickNote({
     border: isDark ? "#304A3B" : "#D4E9DC",
     primary: "#1FA37F",
     placeholder: isDark ? "#82998C" : "#91A99B",
+    backButton: isDark ? "#24382E" : "#FFFFFF",
+    backIcon: isDark ? "#E8F5ED" : "#173C35",
+    softSurface: isDark ? "#20352B" : "rgba(127,160,142,0.07)",
+    softBorder: isDark ? "#304A3B" : "rgba(127,160,142,0.12)",
+    softAction: isDark ? "#263A32" : "#E8F7EE",
+    reminderSurface: isDark ? "#24463A" : "#E2F7EB",
   };
+
+  const {
+    isEditMode,
+    editTodo: editTodoParam,
+    folderId: folderIdParam,
+  } = useLocalSearchParams();
+
+  // Folder assignment is local-only. The note itself is still saved to the API.
+  const folderId = String(
+    Array.isArray(folderIdParam)
+      ? (folderIdParam[0] ?? "")
+      : (folderIdParam ?? ""),
+  ).trim();
+
+  const editingNote = useMemo(() => {
+    if (isEditMode !== "true" || !editTodoParam) return null;
+
+    try {
+      return JSON.parse(
+        Array.isArray(editTodoParam) ? editTodoParam[0] : editTodoParam,
+      );
+    } catch {
+      return null;
+    }
+  }, [isEditMode, editTodoParam]);
 
   const [title, setTitle] = useState("");
   const [note, setNote] = useState("");
   const [theme, setTheme] = useState(COLORS[0]);
   const [reminder, setReminder] = useState(null);
 
+  // Populate the editor when a Quick Note is opened in edit mode.
+  useEffect(() => {
+    if (!editingNote) return;
+
+    setTitle(String(editingNote.title ?? ""));
+    setNote(
+      String(
+        editingNote.text ??
+          editingNote.description ??
+          editingNote.content ??
+          editingNote.note ??
+          "",
+      ),
+    );
+
+    const savedTheme =
+      editingNote.quickNoteTheme ??
+      editingNote.theme ??
+      editingNote.quickNoteMeta?.quickNoteTheme;
+
+    if (savedTheme) {
+      if (savedTheme.kind === "image" && savedTheme.uri) {
+        setTheme({
+          id: savedTheme.id || "image",
+          label: savedTheme.label || "Image",
+          kind: "image",
+          uri: savedTheme.uri,
+          bg: savedTheme.bg || "#F4F4F8",
+          accent: savedTheme.accent || PURPLE,
+          hero: savedTheme.hero || ["#E9E1FF", "#CFC1FF"],
+          heroText: savedTheme.heroText || "#2B1A8F",
+        });
+      } else {
+        const allThemes = [...COLORS, ...GRADIENTS, ...PATTERNS];
+        const matchedTheme = allThemes.find(
+          (item) => item.id === savedTheme.id,
+        );
+        if (matchedTheme) setTheme(matchedTheme);
+      }
+    }
+
+    const reminderDate = editingNote.reminderDate;
+    const reminderTime = editingNote.reminderTime;
+    if (reminderDate) {
+      const dateParts = String(reminderDate).split("-").map(Number);
+      const timeParts = String(reminderTime || "09:00")
+        .split(":")
+        .map(Number);
+      if (dateParts.length === 3 && dateParts.every(Number.isFinite)) {
+        const parsedReminder = new Date(
+          dateParts[0],
+          dateParts[1] - 1,
+          dateParts[2],
+          timeParts[0] || 0,
+          timeParts[1] || 0,
+        );
+        if (!Number.isNaN(parsedReminder.getTime()))
+          setReminder(parsedReminder);
+      }
+    }
+  }, [editingNote]);
+
   // One single modal, two views: 'themes' | 'images'
   const [sheet, setSheet] = useState(null);
   const [tab, setTab] = useState("Colors");
 
-  const [pickerMode, setPickerMode] = useState(null); // 'date' | 'time' | 'ios' | null
+  const [pickerMode, setPickerMode] = useState(null); // null | date | time | ios | web
   const [tempDate, setTempDate] = useState(new Date());
 
   const isImage = theme.kind === "image";
@@ -455,10 +555,46 @@ export default function CreateQuickNote({
     return `${d}  •  ${t}`;
   }, [reminder]);
 
-  /* ---- reminder (Android: date -> time dialogs, iOS: bottom sheet) ---- */
+  /* ---- reminder picker: Android, iOS and Web ---- */
   const openReminder = () => {
-    setTempDate(reminder || new Date());
-    setPickerMode(Platform.OS === "ios" ? "ios" : "date");
+    const now = new Date();
+    const initialDate =
+      reminder && reminder.getTime() > now.getTime() ? new Date(reminder) : now;
+
+    setTempDate(initialDate);
+    setPickerMode(
+      Platform.OS === "web" ? "web" : Platform.OS === "ios" ? "ios" : "date",
+    );
+  };
+
+  // Convert a local Date to the value expected by HTML datetime-local.
+  const getWebDateTimeValue = (date) => {
+    const offset = date.getTimezoneOffset();
+    return new Date(date.getTime() - offset * 60000).toISOString().slice(0, 16);
+  };
+
+  const handleWebReminderChange = (value) => {
+    if (!value) return;
+    // datetime-local is local time; avoid parsing it as UTC.
+    const [datePart, timePart] = value.split("T");
+    if (!datePart || !timePart) return;
+    const [year, month, day] = datePart.split("-").map(Number);
+    const [hour, minute] = timePart.split(":").map(Number);
+    const selectedDate = new Date(year, month - 1, day, hour, minute, 0, 0);
+    if (!Number.isNaN(selectedDate.getTime())) setTempDate(selectedDate);
+  };
+
+  const saveReminder = () => {
+    if (!(tempDate instanceof Date) || Number.isNaN(tempDate.getTime())) {
+      Alert.alert("Invalid reminder", "Please choose a valid date and time.");
+      return;
+    }
+    if (tempDate.getTime() <= Date.now()) {
+      Alert.alert("Invalid reminder", "Please choose a future date and time.");
+      return;
+    }
+    setReminder(new Date(tempDate));
+    setPickerMode(null);
   };
 
   const onAndroidChange = (event, selected) => {
@@ -466,6 +602,7 @@ export default function CreateQuickNote({
       setPickerMode(null);
       return;
     }
+
     const d = new Date(tempDate);
     if (pickerMode === "date") {
       d.setFullYear(
@@ -475,11 +612,17 @@ export default function CreateQuickNote({
       );
       setTempDate(d);
       setPickerMode("time");
-    } else {
-      d.setHours(selected.getHours(), selected.getMinutes());
-      setReminder(d);
-      setPickerMode(null);
+      return;
     }
+
+    d.setHours(selected.getHours(), selected.getMinutes(), 0, 0);
+    if (d.getTime() <= Date.now()) {
+      Alert.alert("Invalid reminder", "Please choose a future date and time.");
+      setPickerMode("date");
+      return;
+    }
+    setReminder(d);
+    setPickerMode(null);
   };
 
   /* ---- images ---- */
@@ -555,22 +698,138 @@ export default function CreateQuickNote({
 
   const pad = (n) => String(n).padStart(2, "0");
 
+  // Save a Quick Note on this device when the app is offline or no session token
+  // is available. ViewList already reads and merges the `local_todos` key.
+  const saveQuickNoteLocally = async (
+    editingId = "",
+    attachmentFields = {},
+  ) => {
+    const now = new Date().toISOString();
+    const localId =
+      editingId ||
+      `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const savedTheme = {
+      id: theme.id,
+      label: theme.label,
+      kind: theme.kind,
+      colors: theme.colors || null,
+      pattern: theme.pattern || null,
+      ink: theme.ink || null,
+      uri: theme.kind === "image" ? theme.uri : null,
+      bg: isDefaultTheme ? ui.background : theme.bg || null,
+    };
+
+    const localNote = {
+      ...(editingNote && typeof editingNote === "object" ? editingNote : {}),
+      ...attachmentFields,
+      tdlId: localId,
+      _id: localId,
+      id: localId,
+      title: title.trim(),
+      text: note.trim(),
+      description: note.trim(),
+      content: note.trim(),
+      date: now,
+      createdAt: editingNote?.createdAt || now,
+      updatedAt: now,
+      noteType: "quick",
+      isQuickNote: true,
+      isOfflinePending: true,
+      isLocalCopy: true,
+      isLocalDuplicate: true,
+      syncStatus: "pending",
+      reminderDate: reminder
+        ? `${reminder.getFullYear()}-${pad(reminder.getMonth() + 1)}-${pad(reminder.getDate())}`
+        : null,
+      reminderTime: reminder
+        ? `${pad(reminder.getHours())}:${pad(reminder.getMinutes())}`
+        : null,
+      recurring,
+      theme: savedTheme,
+      quickNoteTheme: savedTheme,
+      quickNoteColor: isDefaultTheme
+        ? ui.background
+        : theme.bg || theme.colors?.[0] || "#FFF8DC",
+    };
+
+    const storageKey = "local_todos";
+    const rawLocalTodos = await AsyncStorage.getItem(storageKey);
+    const localTodos = rawLocalTodos ? JSON.parse(rawLocalTodos) : [];
+    const updatedTodos = [
+      localNote,
+      ...(Array.isArray(localTodos) ? localTodos : []).filter(
+        (item) =>
+          String(item?.tdlId ?? item?._id ?? item?.id ?? item?.todoId ?? "") !==
+          localId,
+      ),
+    ];
+    await AsyncStorage.setItem(storageKey, JSON.stringify(updatedTodos));
+
+    const titleKey = title.trim().toLowerCase();
+    const quickNoteMeta = {
+      isQuickNote: true,
+      title: title.trim(),
+      quickNoteColor: localNote.quickNoteColor,
+      quickNoteTheme: savedTheme,
+      updatedAt: now,
+    };
+    const metaPairs = [
+      [`quick-note-meta:${localId}`, JSON.stringify(quickNoteMeta)],
+    ];
+    if (titleKey)
+      metaPairs.push([
+        `quick-note-meta:${titleKey}`,
+        JSON.stringify(quickNoteMeta),
+      ]);
+    await AsyncStorage.multiSet(metaPairs);
+
+    console.log("[QuickNote] Saved locally for offline viewing:", localId);
+    onCreate?.(localNote);
+    router.push({
+  pathname: "/viewlist",
+  params: { from: "/quicknotes" },
+});
+
+  };
+
   const handleCreate = async () => {
     if (saving) return;
     if (!title.trim() && !note.trim())
       return Alert.alert("Empty note", "Add a title or some text first.");
-
-    if (!apiUrl) {
-      Alert.alert("Configuration error", "The API URL is missing.");
-      return;
-    }
 
     if (reminder && reminder.getTime() <= Date.now()) {
       Alert.alert("Invalid reminder", "Please choose a future date and time.");
       return;
     }
 
+    // Preserve existing attachment IDs and metadata when editing a Quick Note.
+    // This screen does not edit attachments, so changing title/text/theme must not
+    // silently remove the attachments saved on the original note.
+    const preservedAttachmentFields = {};
+    if (editingNote && typeof editingNote === "object") {
+      const attachmentFieldNames = [
+        "fileIds",
+        "fileNames",
+        "fileTypes",
+        "attachmentIds",
+        "attachmentNames",
+        "attachmentTypes",
+        "attachments",
+        "mimeTypes",
+        "mediaTypes",
+        "media",
+        "type",
+      ];
+
+      for (const fieldName of attachmentFieldNames) {
+        if (Object.prototype.hasOwnProperty.call(editingNote, fieldName)) {
+          preservedAttachmentFields[fieldName] = editingNote[fieldName];
+        }
+      }
+    }
+
     const payload = {
+      ...preservedAttachmentFields,
       title: title.trim(),
       text: note.trim(),
       date: new Date().toISOString(),
@@ -607,34 +866,166 @@ export default function CreateQuickNote({
 
     try {
       setSaving(true);
-      // Read the saved token inside this async function (never use await during render).
+
+      const editingId = String(
+        editingNote?.tdlId ??
+          editingNote?._id ??
+          editingNote?.id ??
+          editingNote?.todoId ??
+          "",
+      ).trim();
+
+      // A duplicated note uses a local-* ID. Edit and save that copy only in
+      // AsyncStorage; do not update the original note or call the backend API.
+      const isLocalCopy =
+        isEditMode === "true" &&
+        !!editingNote &&
+        (String(editingNote.tdlId ?? editingNote.id ?? "").startsWith(
+          "local-",
+        ) ||
+          editingNote.isLocalDuplicate === true ||
+          editingNote.isLocalCopy === true);
+
+      if (isLocalCopy) {
+        const now = new Date().toISOString();
+        const savedTheme = {
+          id: theme.id,
+          label: theme.label,
+          kind: theme.kind,
+          colors: theme.colors || null,
+          pattern: theme.pattern || null,
+          ink: theme.ink || null,
+          uri: theme.kind === "image" ? theme.uri : null,
+          bg: isDefaultTheme ? ui.background : theme.bg || null,
+        };
+
+        const updatedLocalNote = {
+          ...editingNote,
+          tdlId: editingId,
+          id: editingNote.id ?? editingId,
+          title: title.trim(),
+          text: note.trim(),
+          description: note.trim(),
+          content: note.trim(),
+          date: editingNote.date || now.slice(0, 10),
+          updatedAt: now,
+          noteType: "quick",
+          isQuickNote: true,
+          isLocalCopy: true,
+          reminderDate: reminder
+            ? `${reminder.getFullYear()}-${pad(reminder.getMonth() + 1)}-${pad(reminder.getDate())}`
+            : null,
+          reminderTime: reminder
+            ? `${pad(reminder.getHours())}:${pad(reminder.getMinutes())}`
+            : null,
+          theme: savedTheme,
+          quickNoteTheme: savedTheme,
+          quickNoteColor: isDefaultTheme
+            ? ui.background
+            : theme.bg || theme.colors?.[0] || "#FFF8DC",
+        };
+
+        const storageKey = "local_todos";
+        const rawLocalTodos = await AsyncStorage.getItem(storageKey);
+        const localTodos = rawLocalTodos ? JSON.parse(rawLocalTodos) : [];
+        const updatedTodos = [
+          updatedLocalNote,
+          ...localTodos.filter(
+            (item) =>
+              String(item.tdlId ?? item._id ?? item.id ?? item.todoId ?? "") !==
+              editingId,
+          ),
+        ];
+        await AsyncStorage.setItem(storageKey, JSON.stringify(updatedTodos));
+
+        const titleKey = title.trim().toLowerCase();
+        const quickNoteMeta = {
+          isQuickNote: true,
+          title: title.trim(),
+          quickNoteColor: updatedLocalNote.quickNoteColor,
+          quickNoteTheme: savedTheme,
+          updatedAt: now,
+        };
+        const metaPairs = [
+          [`quick-note-meta:${editingId}`, JSON.stringify(quickNoteMeta)],
+        ];
+        if (titleKey)
+          metaPairs.push([
+            `quick-note-meta:${titleKey}`,
+            JSON.stringify(quickNoteMeta),
+          ]);
+        await AsyncStorage.multiSet(metaPairs);
+
+        onCreate?.(updatedLocalNote);
+       router.push({
+  pathname: "/viewlist",
+  params: { from: "/quicknotes" },
+});
+        return;
+      }
+
+      // Only server-backed notes require an authentication token.
       const token =
         authToken ||
         (await AsyncStorage.getItem("login_token")) ||
         (await AsyncStorage.getItem("token"));
 
-      if (!token) {
+      // Without a saved login token, keep the note locally instead of blocking
+      // creation. It will still appear in ViewList and can be synced later.
+      if (!token || !apiUrl) {
+        await saveQuickNoteLocally(editingId, preservedAttachmentFields);
+        return;
+      }
+
+      if (isEditMode === "true" && !editingId) {
         Alert.alert(
-          "Sign in required",
-          "Please sign in again before creating a note.",
+          "Cannot update note",
+          "This Quick Note has no database ID. Please open it again from the saved notes list.",
         );
         return;
       }
+
+      if (isEditMode === "true" && !updateApiUrl) {
+        Alert.alert(
+          "Configuration error",
+          "The Quick Note update API URL is missing.",
+        );
+        return;
+      }
+
+      const requestUrl =
+        isEditMode === "true"
+          ? `${updateApiUrl.replace(/\/$/, "")}/${encodeURIComponent(editingId)}`
+          : apiUrl;
+      const requestMethod = isEditMode === "true" ? "PUT" : "POST";
 
       console.log(
         "📤 QUICK NOTE SAVE PAYLOAD:",
         JSON.stringify(payload, null, 2),
       );
-      console.log("🧭 QUICK NOTE SAVE ENDPOINT:", apiUrl);
-
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(payload),
+      console.log("🧭 QUICK NOTE SAVE REQUEST:", {
+        method: requestMethod,
+        url: requestUrl,
       });
+
+      let res;
+      try {
+        res = await fetch(requestUrl, {
+          method: requestMethod,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(payload),
+        });
+      } catch (networkError) {
+        console.warn(
+          "[QuickNote] Network unavailable; saving locally:",
+          networkError,
+        );
+        await saveQuickNoteLocally(editingId, preservedAttachmentFields);
+        return;
+      }
       const json = await res.json().catch(() => ({}));
       console.log("📥 QUICK NOTE SAVE RESPONSE:", {
         status: res.status,
@@ -646,7 +1037,11 @@ export default function CreateQuickNote({
       if (!res.ok || json.success === false) {
         const msg = Array.isArray(json.errors)
           ? json.errors.join("\n")
-          : json.message || json.error || "Could not create note";
+          : json.message ||
+            json.error ||
+            (isEditMode === "true"
+              ? "Could not update note"
+              : "Could not create note");
         Alert.alert("Error", msg);
         return;
       }
@@ -659,8 +1054,49 @@ export default function CreateQuickNote({
           savedItem?._id ??
           savedItem?.id ??
           savedItem?.todoId ??
+          editingNote?.tdlId ??
+          editingNote?._id ??
+          editingNote?.id ??
+          editingNote?.todoId ??
           "",
       ).trim();
+
+      // Persist the folder link on this device, using the same metadata store
+      // that the Todo List screen reads. Do not send folderId to the backend.
+      if (savedId) {
+        try {
+          const organizationKey = "notes:organization-meta";
+          const rawOrganizationMeta =
+            await AsyncStorage.getItem(organizationKey);
+          const organizationMeta = rawOrganizationMeta
+            ? JSON.parse(rawOrganizationMeta)
+            : {};
+
+          // If this screen was opened from a folder, assign/update that folder.
+          // If folderId is absent (for example, editing from the general list),
+          // preserve any existing local folder assignment.
+          if (folderId) {
+            organizationMeta[savedId] = {
+              ...(organizationMeta[savedId] || {}),
+              folderId,
+            };
+            await AsyncStorage.setItem(
+              organizationKey,
+              JSON.stringify(organizationMeta),
+            );
+            console.log("[QuickNote Folder] Saved local assignment:", {
+              savedId,
+              folderId,
+            });
+          }
+        } catch (folderError) {
+          console.error(
+            "[QuickNote Folder] Failed to save local folder assignment:",
+            folderError,
+          );
+        }
+      }
+
       const titleKey = title.trim().toLowerCase();
       const quickNoteMeta = {
         isQuickNote:
@@ -705,16 +1141,21 @@ export default function CreateQuickNote({
         metaPairs.map(([key]) => key),
       );
       onCreate?.({
-        ...savedItem,
+        ...(editingNote && typeof editingNote === "object" ? editingNote : {}),
+        ...(savedItem && typeof savedItem === "object" ? savedItem : {}),
+        ...preservedAttachmentFields,
         theme: quickNoteMeta.quickNoteTheme,
         quickNoteTheme: quickNoteMeta.quickNoteTheme,
       });
-      router.replace("/viewlist");
+     router.push({
+  pathname: "/viewlist",
+  params: { from: "/quicknotes" },
+});
     } catch (e) {
       console.error("Create quick note failed:", e);
       Alert.alert(
         "Network error",
-        `Could not reach the server at ${apiUrl}. Check that the backend is running, the IP/port is correct, and the phone can access it.`,
+        `Could not complete the request to ${isEditMode === "true" ? updateApiUrl : apiUrl}. Check the backend URL and update route.`,
       );
     } finally {
       setSaving(false);
@@ -733,22 +1174,46 @@ export default function CreateQuickNote({
         behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
         {/* Header */}
-        <View style={[styles.header, { backgroundColor: "transparent" }]}>
+        <View
+          style={[
+            styles.header,
+            isDesktop && styles.desktopHeader,
+            {
+              backgroundColor: "transparent",
+              flexDirection: "row",
+              alignItems: "center",
+            },
+          ]}
+        >
           <TouchableOpacity
-            onPress={onBack || (() => router.back())}
-            hitSlop={12}
-            style={styles.backBtn}
+            style={[styles.backBtn, { backgroundColor: ui.backButton }]}
+            onPress={() => router.back()}
+            accessibilityRole="button"
+            accessibilityLabel="Go back"
+            activeOpacity={0.7}
           >
-            <Ionicons name="chevron-back" size={26} color={ui.text} />
+            <Ionicons name="arrow-back" size={22} color={ui.backIcon} />
           </TouchableOpacity>
-          <Text style={[styles.headerTitle, { color: ui.text }]}>
-            Create Quick Note
+
+          <Text
+            style={[
+              styles.headerTitle,
+              {
+                color: ui.text,
+                flex: 1,
+                textAlign: "center",
+              },
+            ]}
+          >
+            {isEditMode === "true" ? "Edit Quick Note" : "Create Quick Note"}
           </Text>
-          <View style={styles.backBtn} />
         </View>
 
         <ScrollView
-          contentContainerStyle={styles.scroll}
+          contentContainerStyle={[
+            styles.scroll,
+            isDesktop && styles.desktopScroll,
+          ]}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
@@ -757,7 +1222,7 @@ export default function CreateQuickNote({
             colors={heroColors}
             start={{ x: 0, y: 0 }}
             end={{ x: 1, y: 1 }}
-            style={styles.hero}
+            style={[styles.hero, isDesktop && styles.desktopHero]}
           >
             <View style={{ flex: 1 }}>
               <View
@@ -803,240 +1268,549 @@ export default function CreateQuickNote({
             </View>
           </LinearGradient>
 
-          {/* Title */}
-          <View style={styles.sectionHeading}>
-            <Text
-              style={[
-                styles.label,
-                { color: ui.text, marginTop: 24, marginBottom: 10 },
-              ]}
-            >
-              Title
-            </Text>
-            <Text style={[styles.optionalText, { color: ui.secondaryText }]}>
-              OPTIONAL
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.fieldCard,
-              { backgroundColor: ui.surface, borderColor: ui.border },
-            ]}
-          >
-            <Ionicons name="text-outline" size={20} color={ui.primary} />
-            <TextInput
-              value={title}
-              onChangeText={setTitle}
-              placeholder="Give your note a title..."
-              placeholderTextColor={ui.placeholder}
-              returnKeyType="next"
-              style={[styles.titleInput, { color: ui.text }]}
-            />
-          </View>
-
-          {/* Note */}
-          <View style={styles.sectionHeading}>
-            <Text
-              style={[
-                styles.label,
-                { color: ui.text, marginTop: 22, marginBottom: 10 },
-              ]}
-            >
-              Your note
-            </Text>
-            <Text style={[styles.optionalText, { color: ui.secondaryText }]}>
-              UP TO {MAX_CHARS} CHARACTERS
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.noteCard,
-              { backgroundColor: ui.surface, borderColor: ui.border },
-            ]}
-          >
-            <TextInput
-              value={note}
-              onChangeText={(t) => setNote(t.slice(0, MAX_CHARS))}
-              placeholder="What's on your mind? Start writing..."
-              placeholderTextColor={ui.placeholder}
-              multiline
-              textAlignVertical="top"
-              style={[styles.noteInput, { color: ui.text }]}
-            />
-            <View style={[styles.counterRow, { borderTopColor: ui.border }]}>
-              <View style={styles.writingHint}>
-                <Ionicons
-                  name="create-outline"
-                  size={14}
-                  color={ui.secondaryText}
-                />
-                <Text
-                  style={[styles.writingHintText, { color: ui.secondaryText }]}
-                >
-                  Your thoughts, your space
-                </Text>
-              </View>
-              <Text
-                style={[
-                  styles.counter,
-                  {
-                    color:
-                      note.length >= MAX_CHARS ? "#DC2626" : ui.secondaryText,
-                  },
-                ]}
-              >
-                {note.length}/{MAX_CHARS}
-              </Text>
-            </View>
-          </View>
-
-          {/* Theme */}
-          <View style={[styles.rowBetween, { marginTop: 6 }]}>
-            <View>
-              <Text
-                style={[
-                  styles.label,
-                  { color: ui.text, marginTop: 22, marginBottom: 4 },
-                ]}
-              >
-                Personalize
-              </Text>
-              <Text style={[styles.sectionHint, { color: ui.secondaryText }]}>
-                Choose a background that feels like you.
-              </Text>
-            </View>
-            <TouchableOpacity
-              onPress={() => {
-                setTab("Colors");
-                setSheet("themes");
-              }}
-              style={[
-                styles.seeAll,
-                { backgroundColor: isDark ? "#24382E" : "#E4F5EB" },
-              ]}
-            >
-              <Text style={[styles.seeAllText, { color: ui.primary }]}>
-                View all
-              </Text>
-              <Ionicons name="arrow-forward" size={14} color={ui.primary} />
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.themeGrid}>
-            {MAIN_ROW.map((t) => (
-              <View key={t.id} style={styles.themeCell}>
-                <Swatch
-                  theme={t}
-                  selected={theme.id === t.id}
-                  selectedColor={ui.primary}
-                  size={62}
-                  onPress={() => setTheme(t)}
-                />
-                <Text
+          {isDesktop ? (
+            <View style={styles.desktopColumns}>
+              <View style={styles.desktopColumn}>
+                {/* Title */}
+                <View style={styles.sectionHeading}>
+                  <Text
+                    style={[
+                      styles.label,
+                      {
+                        color: ui.text,
+                        marginTop: isDesktop ? 12 : 24,
+                        marginBottom: 8,
+                      },
+                    ]}
+                  >
+                    Title
+                  </Text>
+                  <Text
+                    style={[styles.optionalText, { color: ui.secondaryText }]}
+                  >
+                    OPTIONAL
+                  </Text>
+                </View>
+                <View
                   style={[
-                    styles.themeName,
-                    { color: ui.text },
-                    theme.id === t.id && {
-                      color: ui.primary,
-                      fontWeight: "700",
+                    styles.fieldCard,
+                    { backgroundColor: ui.surface, borderColor: ui.border },
+                  ]}
+                >
+                  <Ionicons name="text-outline" size={20} color={ui.primary} />
+                  <TextInput
+                    value={title}
+                    onChangeText={setTitle}
+                    placeholder="Give your note a title..."
+                    placeholderTextColor={ui.placeholder}
+                    returnKeyType="next"
+                    style={[styles.titleInput, { color: ui.text }]}
+                  />
+                </View>
+
+                {/* Note */}
+                <View style={styles.sectionHeading}>
+                  <Text
+                    style={[
+                      styles.label,
+                      {
+                        color: ui.text,
+                        marginTop: isDesktop ? 12 : 22,
+                        marginBottom: 8,
+                      },
+                    ]}
+                  >
+                    Your note
+                  </Text>
+                  <Text
+                    style={[styles.optionalText, { color: ui.secondaryText }]}
+                  >
+                    UP TO {MAX_CHARS} CHARACTERS
+                  </Text>
+                </View>
+                <View
+                  style={[
+                    styles.noteCard,
+                    { backgroundColor: ui.surface, borderColor: ui.border },
+                  ]}
+                >
+                  <TextInput
+                    value={note}
+                    onChangeText={(t) => setNote(t.slice(0, MAX_CHARS))}
+                    placeholder="What's on your mind? Start writing..."
+                    placeholderTextColor={ui.placeholder}
+                    multiline
+                    textAlignVertical="top"
+                    style={[styles.noteInput, { color: ui.text }]}
+                  />
+                  <View
+                    style={[styles.counterRow, { borderTopColor: ui.border }]}
+                  >
+                    <View style={styles.writingHint}>
+                      <Ionicons
+                        name="create-outline"
+                        size={14}
+                        color={ui.secondaryText}
+                      />
+                      <Text
+                        style={[
+                          styles.writingHintText,
+                          { color: ui.secondaryText },
+                        ]}
+                      >
+                        Your thoughts, your space
+                      </Text>
+                    </View>
+                    <Text
+                      style={[
+                        styles.counter,
+                        {
+                          color:
+                            note.length >= MAX_CHARS
+                              ? "#DC2626"
+                              : ui.secondaryText,
+                        },
+                      ]}
+                    >
+                      {note.length}/{MAX_CHARS}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+              <View style={styles.desktopColumn}>
+                {/* Theme */}
+                <View style={[styles.rowBetween, { marginTop: 6 }]}>
+                  <View>
+                    <Text
+                      style={[
+                        styles.label,
+                        {
+                          color: ui.text,
+                          marginTop: isDesktop ? 12 : 22,
+                          marginBottom: 4,
+                        },
+                      ]}
+                    >
+                      Personalize
+                    </Text>
+                    <Text
+                      style={[styles.sectionHint, { color: ui.secondaryText }]}
+                    >
+                      Choose a background that feels like you.
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setTab("Colors");
+                      setSheet("themes");
+                    }}
+                    style={[styles.seeAll, { backgroundColor: ui.softAction }]}
+                  >
+                    <Text style={[styles.seeAllText, { color: ui.primary }]}>
+                      View all
+                    </Text>
+                    <Ionicons
+                      name="arrow-forward"
+                      size={14}
+                      color={ui.primary}
+                    />
+                  </TouchableOpacity>
+                </View>
+
+                <View
+                  style={[
+                    styles.themeGrid,
+                    {
+                      backgroundColor: ui.softSurface,
+                      borderColor: ui.softBorder,
                     },
                   ]}
                 >
-                  {t.label}
+                  {MAIN_ROW.map((t) => (
+                    <View key={t.id} style={styles.themeCell}>
+                      <Swatch
+                        theme={t}
+                        selected={theme.id === t.id}
+                        selectedColor={ui.primary}
+                        size={62}
+                        onPress={() => setTheme(t)}
+                      />
+                      <Text
+                        style={[
+                          styles.themeName,
+                          { color: ui.text },
+                          theme.id === t.id && {
+                            color: ui.primary,
+                            fontWeight: "700",
+                          },
+                        ]}
+                      >
+                        {t.label}
+                      </Text>
+                    </View>
+                  ))}
+                  <View style={styles.themeCell}>
+                    {isImage ? (
+                      <Swatch
+                        theme={theme}
+                        selected
+                        selectedColor={ui.primary}
+                        size={62}
+                        onPress={() => setSheet("images")}
+                      />
+                    ) : (
+                      <ImageSwatch
+                        onPress={() => setSheet("images")}
+                        primary={ui.primary}
+                        isDark={isDark}
+                      />
+                    )}
+                    <Text
+                      style={[
+                        styles.themeName,
+                        { color: ui.text },
+                        isImage && { color: ui.primary, fontWeight: "700" },
+                      ]}
+                    >
+                      Image
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Reminder */}
+                <View style={styles.sectionHeading}>
+                  <Text
+                    style={[
+                      styles.label,
+                      {
+                        color: ui.text,
+                        marginTop: isDesktop ? 14 : 24,
+                        marginBottom: 8,
+                      },
+                    ]}
+                  >
+                    Reminder
+                  </Text>
+                  <Text
+                    style={[styles.optionalText, { color: ui.secondaryText }]}
+                  >
+                    OPTIONAL
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  activeOpacity={0.82}
+                  onPress={openReminder}
+                  style={[
+                    styles.reminderCard,
+                    {
+                      backgroundColor: ui.surface,
+                      borderColor: reminder ? ui.primary : ui.border,
+                    },
+                  ]}
+                >
+                  <View
+                    style={[
+                      styles.reminderIconWrap,
+                      { backgroundColor: ui.reminderSurface },
+                    ]}
+                  >
+                    <Ionicons
+                      name="notifications-outline"
+                      size={21}
+                      color={ui.primary}
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.reminderTitle, { color: ui.text }]}>
+                      {reminderLabel
+                        ? "Reminder scheduled"
+                        : "Never miss a thought"}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.reminderText,
+                        {
+                          color: reminderLabel ? ui.primary : ui.secondaryText,
+                        },
+                      ]}
+                    >
+                      {reminderLabel || "Tap to choose date and time"}
+                    </Text>
+                  </View>
+                  <Ionicons
+                    name={
+                      reminderLabel ? "checkmark-circle" : "chevron-forward"
+                    }
+                    size={21}
+                    color={reminderLabel ? ui.primary : ui.secondaryText}
+                  />
+                </TouchableOpacity>
+              </View>
+            </View>
+          ) : (
+            <>
+              {/* Title */}
+              <View style={styles.sectionHeading}>
+                <Text
+                  style={[
+                    styles.label,
+                    { color: ui.text, marginTop: 24, marginBottom: 10 },
+                  ]}
+                >
+                  Title
+                </Text>
+                <Text
+                  style={[styles.optionalText, { color: ui.secondaryText }]}
+                >
+                  OPTIONAL
                 </Text>
               </View>
-            ))}
-            <View style={styles.themeCell}>
-              {isImage ? (
-                <Swatch
-                  theme={theme}
-                  selected
-                  selectedColor={ui.primary}
-                  size={62}
-                  onPress={() => setSheet("images")}
-                />
-              ) : (
-                <ImageSwatch
-                  onPress={() => setSheet("images")}
-                  primary={ui.primary}
-                  isDark={isDark}
-                />
-              )}
-              <Text
+              <View
                 style={[
-                  styles.themeName,
-                  { color: ui.text },
-                  isImage && { color: ui.primary, fontWeight: "700" },
+                  styles.fieldCard,
+                  { backgroundColor: ui.surface, borderColor: ui.border },
                 ]}
               >
-                Image
-              </Text>
-            </View>
-          </View>
+                <Ionicons name="text-outline" size={20} color={ui.primary} />
+                <TextInput
+                  value={title}
+                  onChangeText={setTitle}
+                  placeholder="Give your note a title..."
+                  placeholderTextColor={ui.placeholder}
+                  returnKeyType="next"
+                  style={[styles.titleInput, { color: ui.text }]}
+                />
+              </View>
 
-          {/* Reminder */}
-          <View style={styles.sectionHeading}>
-            <Text
-              style={[
-                styles.label,
-                { color: ui.text, marginTop: 24, marginBottom: 10 },
-              ]}
-            >
-              Reminder
-            </Text>
-            <Text style={[styles.optionalText, { color: ui.secondaryText }]}>
-              OPTIONAL
-            </Text>
-          </View>
-          <TouchableOpacity
-            activeOpacity={0.82}
-            onPress={openReminder}
-            style={[
-              styles.reminderCard,
-              {
-                backgroundColor: ui.surface,
-                borderColor: reminder ? ui.primary : ui.border,
-              },
-            ]}
-          >
-            <View
-              style={[
-                styles.reminderIconWrap,
-                { backgroundColor: isDark ? "#24463A" : "#E2F7EB" },
-              ]}
-            >
-              <Ionicons
-                name="notifications-outline"
-                size={21}
-                color={ui.primary}
-              />
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text style={[styles.reminderTitle, { color: ui.text }]}>
-                {reminderLabel ? "Reminder scheduled" : "Never miss a thought"}
-              </Text>
-              <Text
+              {/* Note */}
+              <View style={styles.sectionHeading}>
+                <Text
+                  style={[
+                    styles.label,
+                    { color: ui.text, marginTop: 22, marginBottom: 10 },
+                  ]}
+                >
+                  Your note
+                </Text>
+                <Text
+                  style={[styles.optionalText, { color: ui.secondaryText }]}
+                >
+                  UP TO {MAX_CHARS} CHARACTERS
+                </Text>
+              </View>
+              <View
                 style={[
-                  styles.reminderText,
-                  { color: reminderLabel ? ui.primary : ui.secondaryText },
+                  styles.noteCard,
+                  { backgroundColor: ui.surface, borderColor: ui.border },
                 ]}
               >
-                {reminderLabel || "Tap to choose date and time"}
-              </Text>
-            </View>
-            <Ionicons
-              name={reminderLabel ? "checkmark-circle" : "chevron-forward"}
-              size={21}
-              color={reminderLabel ? ui.primary : ui.secondaryText}
-            />
-          </TouchableOpacity>
+                <TextInput
+                  value={note}
+                  onChangeText={(t) => setNote(t.slice(0, MAX_CHARS))}
+                  placeholder="What's on your mind? Start writing..."
+                  placeholderTextColor={ui.placeholder}
+                  multiline
+                  textAlignVertical="top"
+                  style={[styles.noteInput, { color: ui.text }]}
+                />
+                <View
+                  style={[styles.counterRow, { borderTopColor: ui.border }]}
+                >
+                  <View style={styles.writingHint}>
+                    <Ionicons
+                      name="create-outline"
+                      size={14}
+                      color={ui.secondaryText}
+                    />
+                    <Text
+                      style={[
+                        styles.writingHintText,
+                        { color: ui.secondaryText },
+                      ]}
+                    >
+                      Your thoughts, your space
+                    </Text>
+                  </View>
+                  <Text
+                    style={[
+                      styles.counter,
+                      {
+                        color:
+                          note.length >= MAX_CHARS
+                            ? "#DC2626"
+                            : ui.secondaryText,
+                      },
+                    ]}
+                  >
+                    {note.length}/{MAX_CHARS}
+                  </Text>
+                </View>
+              </View>
 
+              {/* Theme */}
+              <View style={[styles.rowBetween, { marginTop: 6 }]}>
+                <View>
+                  <Text
+                    style={[
+                      styles.label,
+                      { color: ui.text, marginTop: 22, marginBottom: 4 },
+                    ]}
+                  >
+                    Personalize
+                  </Text>
+                  <Text
+                    style={[styles.sectionHint, { color: ui.secondaryText }]}
+                  >
+                    Choose a background that feels like you.
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  onPress={() => {
+                    setTab("Colors");
+                    setSheet("themes");
+                  }}
+                  style={[styles.seeAll, { backgroundColor: ui.softAction }]}
+                >
+                  <Text style={[styles.seeAllText, { color: ui.primary }]}>
+                    View all
+                  </Text>
+                  <Ionicons name="arrow-forward" size={14} color={ui.primary} />
+                </TouchableOpacity>
+              </View>
+
+              <View
+                style={[
+                  styles.themeGrid,
+                  {
+                    backgroundColor: ui.softSurface,
+                    borderColor: ui.softBorder,
+                  },
+                ]}
+              >
+                {MAIN_ROW.map((t) => (
+                  <View key={t.id} style={styles.themeCell}>
+                    <Swatch
+                      theme={t}
+                      selected={theme.id === t.id}
+                      selectedColor={ui.primary}
+                      size={62}
+                      onPress={() => setTheme(t)}
+                    />
+                    <Text
+                      style={[
+                        styles.themeName,
+                        { color: ui.text },
+                        theme.id === t.id && {
+                          color: ui.primary,
+                          fontWeight: "700",
+                        },
+                      ]}
+                    >
+                      {t.label}
+                    </Text>
+                  </View>
+                ))}
+                <View style={styles.themeCell}>
+                  {isImage ? (
+                    <Swatch
+                      theme={theme}
+                      selected
+                      selectedColor={ui.primary}
+                      size={62}
+                      onPress={() => setSheet("images")}
+                    />
+                  ) : (
+                    <ImageSwatch
+                      onPress={() => setSheet("images")}
+                      primary={ui.primary}
+                      isDark={isDark}
+                    />
+                  )}
+                  <Text
+                    style={[
+                      styles.themeName,
+                      { color: ui.text },
+                      isImage && { color: ui.primary, fontWeight: "700" },
+                    ]}
+                  >
+                    Image
+                  </Text>
+                </View>
+              </View>
+
+              {/* Reminder */}
+              <View style={styles.sectionHeading}>
+                <Text
+                  style={[
+                    styles.label,
+                    { color: ui.text, marginTop: 24, marginBottom: 10 },
+                  ]}
+                >
+                  Reminder
+                </Text>
+                <Text
+                  style={[styles.optionalText, { color: ui.secondaryText }]}
+                >
+                  OPTIONAL
+                </Text>
+              </View>
+              <TouchableOpacity
+                activeOpacity={0.82}
+                onPress={openReminder}
+                style={[
+                  styles.reminderCard,
+                  {
+                    backgroundColor: ui.surface,
+                    borderColor: reminder ? ui.primary : ui.border,
+                  },
+                ]}
+              >
+                <View
+                  style={[
+                    styles.reminderIconWrap,
+                    { backgroundColor: ui.reminderSurface },
+                  ]}
+                >
+                  <Ionicons
+                    name="notifications-outline"
+                    size={21}
+                    color={ui.primary}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.reminderTitle, { color: ui.text }]}>
+                    {reminderLabel
+                      ? "Reminder scheduled"
+                      : "Never miss a thought"}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.reminderText,
+                      { color: reminderLabel ? ui.primary : ui.secondaryText },
+                    ]}
+                  >
+                    {reminderLabel || "Tap to choose date and time"}
+                  </Text>
+                </View>
+                <Ionicons
+                  name={reminderLabel ? "checkmark-circle" : "chevron-forward"}
+                  size={21}
+                  color={reminderLabel ? ui.primary : ui.secondaryText}
+                />
+              </TouchableOpacity>
+            </>
+          )}
           {/* CTA */}
           <TouchableOpacity
             activeOpacity={0.88}
             onPress={handleCreate}
             disabled={saving}
-            style={{ marginTop: 28 }}
+            style={{
+              marginTop: isDesktop ? 20 : 28,
+              maxWidth: isDesktop ? 620 : undefined,
+              alignSelf: isDesktop ? "center" : undefined,
+              width: isDesktop ? "100%" : undefined,
+            }}
           >
             <LinearGradient
               colors={accent}
@@ -1058,7 +1832,9 @@ export default function CreateQuickNote({
                     size={22}
                     color="#FFFFFF"
                   />
-                  <Text style={styles.ctaText}>Create note</Text>
+                  <Text style={styles.ctaText}>
+                    {isEditMode === "true" ? "Update note" : "Create note"}
+                  </Text>
                   <Ionicons name="arrow-forward" size={19} color="#FFFFFF" />
                 </View>
               )}
@@ -1251,7 +2027,7 @@ export default function CreateQuickNote({
                   onPress={chooseFromGallery}
                   style={[
                     styles.galleryBtn,
-                    { backgroundColor: isDark ? "#263A32" : "#E8F7EE" },
+                    { backgroundColor: ui.softAction },
                   ]}
                 >
                   <Ionicons name="image-outline" size={18} color={ui.primary} />
@@ -1266,6 +2042,8 @@ export default function CreateQuickNote({
       </Modal>
 
       {/* ---------------- Date / time picker ---------------- */}
+
+      {/* ANDROID: native date picker followed by native time picker */}
       {Platform.OS === "android" &&
         (pickerMode === "date" || pickerMode === "time") && (
           <DateTimePicker
@@ -1276,6 +2054,7 @@ export default function CreateQuickNote({
           />
         )}
 
+      {/* IOS: native spinner inside a bottom sheet */}
       {Platform.OS === "ios" && (
         <Modal
           visible={pickerMode === "ios"}
@@ -1311,27 +2090,216 @@ export default function CreateQuickNote({
               <View
                 style={[styles.sheetHandle, { backgroundColor: ui.border }]}
               />
+              <Text
+                style={{
+                  color: ui.text,
+                  fontSize: 18,
+                  fontWeight: "800",
+                  textAlign: "center",
+                  marginBottom: 12,
+                }}
+              >
+                Select Reminder
+              </Text>
               <DateTimePicker
                 value={tempDate}
                 mode="datetime"
                 display="spinner"
                 minimumDate={new Date()}
-                onChange={(_, d) => d && setTempDate(d)}
+                onChange={(_, date) => {
+                  if (date) setTempDate(date);
+                }}
               />
               <TouchableOpacity
-                style={[
-                  styles.galleryBtn,
-                  { backgroundColor: isDark ? "#263A32" : "#E8F7EE" },
-                ]}
-                onPress={() => {
-                  setReminder(tempDate);
-                  setPickerMode(null);
-                }}
+                style={[styles.galleryBtn, { backgroundColor: ui.softAction }]}
+                onPress={saveReminder}
               >
                 <Text style={[styles.galleryText, { color: ui.primary }]}>
                   Set Reminder
                 </Text>
               </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+      )}
+
+      {/* WEB: browser-native date and time input in a themed modal */}
+      {Platform.OS === "web" && (
+        <Modal
+          visible={pickerMode === "web"}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setPickerMode(null)}
+        >
+          <View
+            style={{
+              flex: 1,
+              justifyContent: "center",
+              alignItems: "center",
+              padding: 20,
+              backgroundColor: "rgba(0,0,0,0.45)",
+            }}
+          >
+            <View
+              style={{
+                width: "100%",
+                maxWidth: 430,
+                padding: 24,
+                borderRadius: 20,
+                backgroundColor: ui.surface,
+                borderWidth: 1,
+                borderColor: ui.border,
+                ...(Platform.OS === "web"
+                  ? { boxShadow: "0 12px 36px rgba(0,0,0,0.18)" }
+                  : {}),
+              }}
+            >
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  marginBottom: 20,
+                }}
+              >
+                <View>
+                  <Text
+                    style={{ color: ui.text, fontSize: 20, fontWeight: "800" }}
+                  >
+                    Set Reminder
+                  </Text>
+                  <Text
+                    style={{
+                      color: ui.secondaryText,
+                      fontSize: 13,
+                      marginTop: 5,
+                    }}
+                  >
+                    Choose a future date and time
+                  </Text>
+                </View>
+                <TouchableOpacity onPress={() => setPickerMode(null)}>
+                  <Ionicons
+                    name="close-circle-outline"
+                    size={26}
+                    color={ui.secondaryText}
+                  />
+                </TouchableOpacity>
+              </View>
+
+              <Text
+                style={{
+                  color: ui.text,
+                  fontSize: 14,
+                  fontWeight: "700",
+                  marginBottom: 9,
+                }}
+              >
+                Date & Time
+              </Text>
+
+              <input
+                type="datetime-local"
+                value={getWebDateTimeValue(tempDate)}
+                min={getWebDateTimeValue(new Date())}
+                onChange={(event) =>
+                  handleWebReminderChange(event.target.value)
+                }
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  height: 48,
+                  padding: "0 12px",
+                  borderRadius: 10,
+                  border: `1px solid ${ui.border}`,
+                  backgroundColor: ui.background,
+                  color: ui.text,
+                  fontSize: 15,
+                  outline: "none",
+                }}
+              />
+
+              <View
+                style={{
+                  marginTop: 16,
+                  padding: 14,
+                  borderRadius: 12,
+                  backgroundColor: ui.reminderSurface,
+                }}
+              >
+                <View
+                  style={{ flexDirection: "row", alignItems: "center", gap: 8 }}
+                >
+                  <Ionicons
+                    name="notifications-outline"
+                    size={18}
+                    color={ui.primary}
+                  />
+                  <Text
+                    style={{
+                      color: ui.primary,
+                      fontSize: 14,
+                      fontWeight: "700",
+                    }}
+                  >
+                    {tempDate.toLocaleDateString("en-GB", {
+                      weekday: "short",
+                      day: "2-digit",
+                      month: "short",
+                      year: "numeric",
+                    })}
+                  </Text>
+                </View>
+                <Text
+                  style={{
+                    color: ui.text,
+                    fontSize: 19,
+                    fontWeight: "800",
+                    marginTop: 7,
+                  }}
+                >
+                  {tempDate.toLocaleTimeString("en-US", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </Text>
+              </View>
+
+              <View
+                style={{
+                  flexDirection: "row",
+                  justifyContent: "flex-end",
+                  gap: 10,
+                  marginTop: 22,
+                }}
+              >
+                <TouchableOpacity
+                  onPress={() => setPickerMode(null)}
+                  style={{
+                    paddingHorizontal: 18,
+                    paddingVertical: 12,
+                    borderRadius: 10,
+                    backgroundColor: ui.softAction,
+                  }}
+                >
+                  <Text style={{ color: ui.secondaryText, fontWeight: "700" }}>
+                    Cancel
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={saveReminder}
+                  style={{
+                    paddingHorizontal: 20,
+                    paddingVertical: 12,
+                    borderRadius: 10,
+                    backgroundColor: ui.primary,
+                  }}
+                >
+                  <Text style={{ color: "#FFFFFF", fontWeight: "700" }}>
+                    Set Reminder
+                  </Text>
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
         </Modal>
@@ -1346,20 +2314,64 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 18,
+    paddingHorizontal: 16,
     paddingVertical: 12,
   },
+
   backBtn: {
-    width: 42,
-    height: 42,
-    borderRadius: 15,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#FFFFFF",
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(127,160,142,0.12)",
   },
-  headerTitle: { fontSize: 18, fontWeight: "800", letterSpacing: -0.35 },
+
+  headerTitle: {
+    fontSize: 20,
+    fontWeight: "700",
+    marginLeft: 12,
+  },
+
   scroll: { paddingHorizontal: 20, paddingBottom: 38 },
+  desktopScroll: {
+    width: "100%",
+    maxWidth: 1440,
+    alignSelf: "center",
+    paddingHorizontal: 40,
+    paddingTop: 12,
+    paddingBottom: 28,
+  },
+  desktopHeader: {
+    width: "100%",
+    maxWidth: 1440,
+    alignSelf: "center",
+    paddingHorizontal: 40,
+    paddingVertical: 10,
+  },
+  desktopHero: {
+    minHeight: 148,
+    paddingHorizontal: 30,
+    paddingVertical: 22,
+    borderRadius: 22,
+    marginBottom: 18,
+  },
+  desktopColumns: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 24,
+    width: "100%",
+  },
+  desktopColumn: {
+    flex: 1,
+    minWidth: 0,
+    backgroundColor: "rgba(255,255,255,0.48)",
+    borderWidth: 1,
+    borderColor: "rgba(127,160,142,0.14)",
+    borderRadius: 20,
+    paddingHorizontal: 22,
+    paddingVertical: 8,
+  },
   hero: {
     borderRadius: 28,
     padding: 21,
@@ -1500,10 +2512,10 @@ const styles = StyleSheet.create({
   themeGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
-    rowGap: 15,
+    rowGap: 10,
     backgroundColor: "rgba(127,160,142,0.07)",
     borderRadius: 22,
-    paddingVertical: 16,
+    paddingVertical: 12,
     paddingHorizontal: 5,
     borderWidth: 1,
     borderColor: "rgba(127,160,142,0.12)",

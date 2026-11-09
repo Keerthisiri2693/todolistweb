@@ -1,27 +1,22 @@
-
-import React, { useMemo, useState } from "react";
+import { Ionicons } from "@expo/vector-icons";
+import * as ImagePicker from "expo-image-picker";
+import { router } from "expo-router";
+import { useMemo, useState } from "react";
 import {
-  View,
+  Alert,
+  Image,
+  Platform,
+  Pressable,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
   Text,
   TextInput,
-  Image,
-  Alert,
-  ScrollView,
-  Pressable,
-  StyleSheet,
-  StatusBar,
   useWindowDimensions,
+  View,
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
-import { router } from "expo-router";
-import * as ImagePicker from "expo-image-picker";
 
-type TemplateCategory =
-  | "Recent"
-  | "List"
-  | "Plan"
-  | "Journal"
-  | "Idea";
+type TemplateCategory = "Recent" | "List" | "Plan" | "Journal" | "Idea";
 
 type NoteTemplate = {
   id: string;
@@ -92,8 +87,7 @@ const templates: NoteTemplate[] = [
     category: "List",
     emoji: "💚",
     background: "#E4EFD9",
-    content:
-      "Donation List\n\n☐ Organization:\n  Amount:\n  Date:\n\nNotes:\n",
+    content: "Donation List\n\n☐ Organization:\n  Amount:\n  Date:\n\nNotes:\n",
   },
   {
     id: "movie",
@@ -263,8 +257,7 @@ const templates: NoteTemplate[] = [
     category: "Idea",
     emoji: "☁️",
     background: "#DCEBFF",
-    content:
-      "Random Thoughts\n\nWhat's on my mind?\n\n\nIdeas to explore:\n",
+    content: "Random Thoughts\n\nWhat's on my mind?\n\n\nIdeas to explore:\n",
   },
   {
     id: "story",
@@ -305,49 +298,96 @@ const templates: NoteTemplate[] = [
 ];
 
 const defaultBackgrounds = [
-  { id: "flowers", title: "Soft Flowers", uri: "https://images.unsplash.com/photo-1490750967868-88aa4486c946?w=900&auto=format&fit=crop&q=85" },
-  { id: "nature", title: "Green Nature", uri: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=900&auto=format&fit=crop&q=85" },
-  { id: "ocean", title: "Ocean Blue", uri: "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=900&auto=format&fit=crop&q=85" },
-  { id: "mountains", title: "Mountain View", uri: "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=900&auto=format&fit=crop&q=85" },
-  { id: "leaves", title: "Tropical Leaves", uri: "https://images.unsplash.com/photo-1518531933037-91b2f5f229cc?w=900&auto=format&fit=crop&q=85" },
-  { id: "sunset", title: "Warm Sunset", uri: "https://images.unsplash.com/photo-1472120435266-53107fd0c44a?w=900&auto=format&fit=crop&q=85" },
-  { id: "clouds", title: "Sky & Clouds", uri: "https://images.unsplash.com/photo-1499346030926-9a72daac6c63?w=900&auto=format&fit=crop&q=85" },
-  { id: "wood", title: "Natural Texture", uri: "https://images.unsplash.com/photo-1507692049790-de58290a4334?w=900&auto=format&fit=crop&q=85" },
+  {
+    id: "flowers",
+    title: "Soft Flowers",
+    uri: "https://images.unsplash.com/photo-1490750967868-88aa4486c946?w=900&auto=format&fit=crop&q=85",
+  },
+  {
+    id: "nature",
+    title: "Green Nature",
+    uri: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=900&auto=format&fit=crop&q=85",
+  },
+  {
+    id: "ocean",
+    title: "Ocean Blue",
+    uri: "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=900&auto=format&fit=crop&q=85",
+  },
+  {
+    id: "mountains",
+    title: "Mountain View",
+    uri: "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=900&auto=format&fit=crop&q=85",
+  },
+  {
+    id: "leaves",
+    title: "Tropical Leaves",
+    uri: "https://images.unsplash.com/photo-1518531933037-91b2f5f229cc?w=900&auto=format&fit=crop&q=85",
+  },
+  {
+    id: "sunset",
+    title: "Warm Sunset",
+    uri: "https://images.unsplash.com/photo-1472120435266-53107fd0c44a?w=900&auto=format&fit=crop&q=85",
+  },
+  {
+    id: "clouds",
+    title: "Sky & Clouds",
+    uri: "https://images.unsplash.com/photo-1499346030926-9a72daac6c63?w=900&auto=format&fit=crop&q=85",
+  },
+  {
+    id: "wood",
+    title: "Natural Texture",
+    uri: "https://images.unsplash.com/photo-1507692049790-de58290a4334?w=900&auto=format&fit=crop&q=85",
+  },
 ];
 
 export default function NoteTemplatesScreen() {
   const [activeCategory, setActiveCategory] =
     useState<TemplateCategory>("List");
   const [searchQuery, setSearchQuery] = useState("");
-  const [customBackgroundUri, setCustomBackgroundUri] = useState<string | null>(null);
-  const [selectedDefaultBackground, setSelectedDefaultBackground] = useState<string | null>(null);
+  const [customBackgroundUri, setCustomBackgroundUri] = useState<string | null>(
+    null,
+  );
+  const [selectedDefaultBackground, setSelectedDefaultBackground] = useState<
+    string | null
+  >(null);
 
   const { width } = useWindowDimensions();
-  const cardWidth = (width - 52) / 2;
+  const isDesktop = Platform.OS === "web" && width >= 900;
+  const isWideDesktop = Platform.OS === "web" && width >= 1400;
+  const contentWidth = Math.min(width, isWideDesktop ? 1480 : 1180);
+  const gridColumns = width >= 1400 ? 4 : width >= 900 ? 3 : 2;
+  const gridGap = isDesktop ? 20 : 15;
+  const gridHorizontalPadding = isDesktop ? 28 : 20;
+  const cardWidth =
+    (contentWidth - gridHorizontalPadding * 2 - gridGap * (gridColumns - 1)) /
+    gridColumns;
 
   const filteredTemplates = useMemo(() => {
-    const base = activeCategory === "Recent"
-      ? templates.slice(0, 8)
-      : activeCategory === "Custom"
-        ? []
-        : templates.filter((item) => item.category === activeCategory);
+    const base =
+      activeCategory === "Recent"
+        ? templates.slice(0, 8)
+        : activeCategory === "Custom"
+          ? []
+          : templates.filter((item) => item.category === activeCategory);
 
     const query = searchQuery.trim().toLowerCase();
     if (!query) return base;
-    return base.filter((item) =>
-      item.title.toLowerCase().includes(query) ||
-      item.content.toLowerCase().includes(query) ||
-      item.category.toLowerCase().includes(query)
+    return base.filter(
+      (item) =>
+        item.title.toLowerCase().includes(query) ||
+        item.content.toLowerCase().includes(query) ||
+        item.category.toLowerCase().includes(query),
     );
   }, [activeCategory, searchQuery]);
 
   const chooseBackgroundFromGallery = async () => {
     try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      const permission =
+        await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!permission.granted) {
         Alert.alert(
           "Gallery permission required",
-          "Allow photo library access to choose a background image."
+          "Allow photo library access to choose a background image.",
         );
         return;
       }
@@ -372,7 +412,10 @@ export default function NoteTemplatesScreen() {
   const useCustomBackground = () => {
     const backgroundUri = customBackgroundUri || selectedDefaultBackground;
     if (!backgroundUri) {
-      Alert.alert("Choose a background", "Select one of the default images or choose a photo from your gallery.");
+      Alert.alert(
+        "Choose a background",
+        "Select one of the default images or choose a photo from your gallery.",
+      );
       return;
     }
 
@@ -405,13 +448,10 @@ export default function NoteTemplatesScreen() {
   };
 
   return (
-    <View style={styles.screen}>
-      <StatusBar
-        barStyle="dark-content"
-        backgroundColor="#F3FAF6"
-      />
+    <View style={[styles.screen, isDesktop && styles.desktopScreen]}>
+      <StatusBar barStyle="dark-content" backgroundColor="#F3FAF6" />
 
-      <View style={styles.header}>
+      <View style={[styles.header, isDesktop && styles.desktopHeader]}>
         <Pressable
           onPress={() => router.back()}
           style={styles.backButton}
@@ -433,7 +473,7 @@ export default function NoteTemplatesScreen() {
         </View>
       </View>
 
-      <View style={styles.searchBox}>
+      <View style={[styles.searchBox, isDesktop && styles.desktopSearchBox]}>
         <Ionicons name="search-outline" size={20} color="#729084" />
         <TextInput
           value={searchQuery}
@@ -451,14 +491,20 @@ export default function NoteTemplatesScreen() {
         )}
       </View>
 
-      <View style={styles.sectionIntro}>
+      <View
+        style={[styles.sectionIntro, isDesktop && styles.desktopSectionIntro]}
+      >
         <View>
           <Text style={styles.sectionTitle}>Explore templates</Text>
-          <Text style={styles.sectionSubTitle}>Pick one and start creating</Text>
+          <Text style={styles.sectionSubTitle}>
+            Pick one and start creating
+          </Text>
         </View>
         <View style={styles.countPill}>
           <Text style={styles.countPillText}>
-            {activeCategory === "Custom" ? "Custom" : `${filteredTemplates.length} layouts`}
+            {activeCategory === "Custom"
+              ? "Custom"
+              : `${filteredTemplates.length} layouts`}
           </Text>
         </View>
       </View>
@@ -466,7 +512,10 @@ export default function NoteTemplatesScreen() {
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.categoryList}
+        contentContainerStyle={[
+          styles.categoryList,
+          isDesktop && styles.desktopCategoryList,
+        ]}
       >
         {categories.map((category) => {
           const selected = category === activeCategory;
@@ -477,7 +526,10 @@ export default function NoteTemplatesScreen() {
               onPress={() => setActiveCategory(category)}
               accessibilityRole="button"
               accessibilityState={{ selected }}
-              style={[styles.categoryButton, selected && styles.categoryButtonActive]}
+              style={[
+                styles.categoryButton,
+                selected && styles.categoryButtonActive,
+              ]}
             >
               <Text
                 style={[
@@ -496,17 +548,23 @@ export default function NoteTemplatesScreen() {
 
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.grid}
+        contentContainerStyle={[styles.grid, isDesktop && styles.desktopGrid]}
       >
         {activeCategory === "Custom" ? (
-          <View style={styles.customContainer}>
+          <View
+            style={[
+              styles.customContainer,
+              isDesktop && styles.desktopCustomContainer,
+            ]}
+          >
             <View style={styles.customIntro}>
               <View style={styles.customIcon}>
                 <Ionicons name="image-outline" size={28} color="#16845F" />
               </View>
               <Text style={styles.customTitle}>Create your own background</Text>
               <Text style={styles.customDescription}>
-                Pick a ready-made background below, or choose your own photo from the gallery.
+                Pick a ready-made background below, or choose your own photo
+                from the gallery.
               </Text>
             </View>
 
@@ -521,17 +579,35 @@ export default function NoteTemplatesScreen() {
                       setSelectedDefaultBackground(background.uri);
                       setCustomBackgroundUri(null);
                     }}
-                    style={[styles.backgroundPresetCard, selected && styles.backgroundPresetCardSelected]}
+                    style={[
+                      styles.backgroundPresetCard,
+                      isDesktop && {
+                        width: gridColumns >= 4 ? "23.5%" : "31.5%",
+                      },
+                      selected && styles.backgroundPresetCardSelected,
+                    ]}
                     accessibilityRole="button"
                     accessibilityLabel={`Select ${background.title} background`}
                   >
-                    <Image source={{ uri: background.uri }} style={styles.backgroundPresetImage} resizeMode="cover" />
+                    <Image
+                      source={{ uri: background.uri }}
+                      style={[
+                        styles.backgroundPresetImage,
+                        isDesktop && { height: 150 },
+                      ]}
+                      resizeMode="cover"
+                    />
                     {selected && (
                       <View style={styles.presetSelectedBadge}>
                         <Ionicons name="checkmark" size={16} color="#FFFFFF" />
                       </View>
                     )}
-                    <Text style={styles.backgroundPresetTitle} numberOfLines={1}>{background.title}</Text>
+                    <Text
+                      style={styles.backgroundPresetTitle}
+                      numberOfLines={1}
+                    >
+                      {background.title}
+                    </Text>
                   </Pressable>
                 );
               })}
@@ -544,9 +620,14 @@ export default function NoteTemplatesScreen() {
               accessibilityRole="button"
               accessibilityLabel="Choose a background image from gallery"
             >
-              {(customBackgroundUri || selectedDefaultBackground) ? (
+              {customBackgroundUri || selectedDefaultBackground ? (
                 <Image
-                  source={{ uri: customBackgroundUri || selectedDefaultBackground || undefined }}
+                  source={{
+                    uri:
+                      customBackgroundUri ||
+                      selectedDefaultBackground ||
+                      undefined,
+                  }}
                   style={styles.customImagePreview}
                   resizeMode="cover"
                 />
@@ -556,13 +637,17 @@ export default function NoteTemplatesScreen() {
                     <Ionicons name="images-outline" size={30} color="#16845F" />
                   </View>
                   <Text style={styles.galleryTitle}>Choose from Gallery</Text>
-                  <Text style={styles.gallerySubtitle}>JPG, PNG or photos on your device</Text>
+                  <Text style={styles.gallerySubtitle}>
+                    JPG, PNG or photos on your device
+                  </Text>
                 </View>
               )}
               <View style={styles.changeImageBadge}>
                 <Ionicons name="camera-outline" size={16} color="#FFFFFF" />
                 <Text style={styles.changeImageText}>
-                  {customBackgroundUri || selectedDefaultBackground ? "Change image" : "Browse photos"}
+                  {customBackgroundUri || selectedDefaultBackground
+                    ? "Change image"
+                    : "Browse photos"}
                 </Text>
               </View>
             </Pressable>
@@ -571,13 +656,20 @@ export default function NoteTemplatesScreen() {
               onPress={useCustomBackground}
               style={[
                 styles.useBackgroundButton,
-                !(customBackgroundUri || selectedDefaultBackground) && styles.useBackgroundButtonDisabled,
+                !(customBackgroundUri || selectedDefaultBackground) &&
+                  styles.useBackgroundButtonDisabled,
               ]}
               accessibilityRole="button"
               accessibilityLabel="Create note with selected background"
             >
-              <Ionicons name="document-text-outline" size={19} color="#FFFFFF" />
-              <Text style={styles.useBackgroundButtonText}>Use Background & Create Note</Text>
+              <Ionicons
+                name="document-text-outline"
+                size={19}
+                color="#FFFFFF"
+              />
+              <Text style={styles.useBackgroundButtonText}>
+                Use Background & Create Note
+              </Text>
             </Pressable>
           </View>
         ) : filteredTemplates.length > 0 ? (
@@ -589,31 +681,41 @@ export default function NoteTemplatesScreen() {
                 style={[
                   styles.templateCard,
                   { width: cardWidth },
+                  isDesktop && styles.desktopTemplateCard,
                 ]}
               >
                 <View
                   style={[
                     styles.templateArtwork,
                     { backgroundColor: template.background },
+                    isDesktop && styles.desktopTemplateArtwork,
                   ]}
                 >
                   <View style={styles.artworkDecoration}>
-                  <View style={styles.emojiBadge}>
-                    <Text style={styles.artworkEmoji}>{template.emoji}</Text>
+                    <View style={styles.emojiBadge}>
+                      <Text style={styles.artworkEmoji}>{template.emoji}</Text>
+                    </View>
+                    <View style={styles.paperPreview}>
+                      <View style={styles.paperTopDot} />
+                      <View style={styles.paperLine} />
+                      <View style={styles.paperLineShort} />
+                      <View style={styles.paperLine} />
+                      <View style={styles.paperLineShort} />
+                    </View>
                   </View>
-                  <View style={styles.paperPreview}>
-                    <View style={styles.paperTopDot} />
-                    <View style={styles.paperLine} />
-                    <View style={styles.paperLineShort} />
-                    <View style={styles.paperLine} />
-                    <View style={styles.paperLineShort} />
-                  </View>
-                </View>
                 </View>
 
-                <View style={styles.cardCaption}>
+                <View
+                  style={[
+                    styles.cardCaption,
+                    isDesktop && styles.desktopCardCaption,
+                  ]}
+                >
                   <Text
-                    style={styles.templateTitle}
+                    style={[
+                      styles.templateTitle,
+                      isDesktop && styles.desktopTemplateTitle,
+                    ]}
                     numberOfLines={2}
                   >
                     {template.title}
@@ -637,6 +739,80 @@ export default function NoteTemplatesScreen() {
 }
 
 const styles = StyleSheet.create({
+  desktopScreen: {
+    alignItems: "center",
+  },
+  desktopHeader: {
+    width: "100%",
+    maxWidth: 1480,
+    minHeight: 154,
+    paddingHorizontal: 32,
+    paddingTop: 28,
+    paddingBottom: 22,
+  },
+  desktopSearchBox: {
+    width: "100%",
+    maxWidth: 1424,
+    alignSelf: "center",
+    minHeight: 58,
+    marginHorizontal: 0,
+    marginTop: 4,
+    marginBottom: 28,
+    borderRadius: 16,
+    paddingHorizontal: 20,
+    borderColor: "#DCECE2",
+    shadowOpacity: 0.045,
+    shadowRadius: 16,
+  },
+  desktopSectionIntro: {
+    width: "100%",
+    maxWidth: 1424,
+    paddingHorizontal: 0,
+    marginBottom: 14,
+  },
+  desktopCategoryList: {
+    width: "100%",
+    maxWidth: 1424,
+    alignSelf: "center",
+    paddingHorizontal: 0,
+    paddingTop: 8,
+    paddingBottom: 18,
+    gap: 10,
+  },
+  desktopGrid: {
+    width: "100%",
+    maxWidth: 1480,
+    alignSelf: "center",
+    paddingHorizontal: 28,
+    paddingTop: 12,
+    paddingBottom: 56,
+  },
+  desktopTemplateCard: {
+    borderRadius: 20,
+    marginBottom: 0,
+    shadowOpacity: 0.055,
+    shadowRadius: 16,
+    elevation: 2,
+  },
+  desktopTemplateArtwork: {
+    height: 184,
+  },
+  desktopCardCaption: {
+    minHeight: 76,
+    paddingHorizontal: 17,
+    paddingVertical: 15,
+  },
+  desktopTemplateTitle: {
+    fontSize: 15,
+    lineHeight: 22,
+  },
+  desktopCustomContainer: {
+    width: "100%",
+    maxWidth: 1180,
+    alignSelf: "center",
+    paddingHorizontal: 8,
+    paddingTop: 20,
+  },
   screen: {
     flex: 1,
     backgroundColor: "#F3FAF6",
@@ -753,7 +929,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 4,
   },
-  
+
   categoryButton: {
     minWidth: 76,
     height: 43,

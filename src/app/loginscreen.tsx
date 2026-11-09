@@ -1,94 +1,109 @@
-import React, { useState } from "react";
+import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import NetInfo from "@react-native-community/netinfo";
+import * as Crypto from "expo-crypto";
+import { useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
   Platform,
-  SafeAreaView,
+  Pressable,
   ScrollView,
   StatusBar,
   StyleSheet,
   Text,
   TextInput,
-  Pressable,
   View,
+  useWindowDimensions,
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import {
-  getMessaging,
-  requestPermission,
-  getToken,
-  AuthorizationStatus,
-} from "@react-native-firebase/messaging";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { getFcmToken } from "../../services/fcmToken";
+import { secureGet, secureSet } from "../../services/secureStorage";
 
-import { getApp } from "@react-native-firebase/app";
 import { router } from "expo-router";
 import API from "../../services/api";
 
-
 const COLORS = {
-  primary: "#39BFA5",
-  background: "#F5F8F7",
-  white: "#FFFFFF",
-  dark: "#20243B",
-  secondary: "#8A91A0",
-  border: "#E8EEEB",
-  mint: "#E3F7F0",
-  paleMint: "#F0FBF7",
-  red: "#F16B6B",
+  primary: "#064E3B",
+  primaryDark: "#043D2F",
+  background: "#F4F2E8",
+  surface: "#FFFFFF",
+  text: "#24352F",
+  secondaryText: "#78827B",
+  border: "#E9E5D9",
+  mint: "#E5F0E9",
+  paleMint: "#FCFBF7",
+  accent: "#D99036",
+  danger: "#C74B45",
 };
 
 export default function LoginScreen() {
+  const { width } = useWindowDimensions();
+  const isDesktop = Platform.OS === "web" && width >= 1000;
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
 
-const requestFCMPermission = async (): Promise<string | null> => {
-  try {
-    const app = getApp();
-    const messagingInstance = getMessaging(app);
-
-    const authStatus = await requestPermission(messagingInstance);
-
-    const enabled =
-      authStatus === AuthorizationStatus.AUTHORIZED ||
-      authStatus === AuthorizationStatus.PROVISIONAL;
-
-    if (!enabled) {
-      console.warn("FCM notification permission not granted");
+  const requestFCMPermission = async (): Promise<string | null> => {
+    // The web/Electron implementation safely returns null. FCM is native-only.
+    try {
+      return await getFcmToken();
+    } catch (error: any) {
+      console.warn(
+        "FCM is unavailable on this platform:",
+        error?.message || error,
+      );
       return null;
     }
+  };
 
-    const token = await getToken(messagingInstance);
-
-    if (!token) {
-      console.warn("Firebase returned an empty FCM token");
-      return null;
-    }
-
-    console.log("FCM token generated successfully:", token);
-    return token;
-  } catch (error: any) {
-    console.error(
-      "FCM initialization/token error:",
-      error?.code,
-      error?.message || error
+  const createPasswordVerifier = async (password: string, salt: string) => {
+    return Crypto.digestStringAsync(
+      Crypto.CryptoDigestAlgorithm.SHA256,
+      `${salt}:${password}`,
     );
-    return null;
-  }
-};
+  };
+
+  const saveOfflineLogin = async (
+    userId: string,
+    userEmail: string,
+    userName: string,
+    password: string,
+  ) => {
+    const salt = Crypto.randomUUID();
+
+    const verifier = await createPasswordVerifier(password, salt);
+
+    // SecureStore keys cannot contain a colon. Normalize the ID so the key
+    // remains valid on Android/iOS, and use the platform-aware helper on web.
+    const safeUserId = userId.replace(/[^A-Za-z0-9._-]/g, "_");
+    await secureSet(
+      `offlineLogin.${safeUserId}`,
+      JSON.stringify({
+        email: userEmail.trim().toLowerCase(),
+        salt,
+        verifier,
+      }),
+    );
+
+    await AsyncStorage.multiSet([
+      ["offlineUserId", userId],
+      ["offlineUserEmail", userEmail.trim().toLowerCase()],
+      ["offlineUserName", userName || ""],
+    ]);
+  };
 
   const handleLogin = async () => {
-    const trimmedEmail = email.trim();
+    const trimmedEmail = email.trim().toLowerCase();
 
     if (!trimmedEmail) {
       Alert.alert("Required", "Please enter your email.");
       return;
     }
 
-    if (!password.trim()) {
+    if (!password) {
       Alert.alert("Required", "Please enter your password.");
       return;
     }
@@ -96,7 +111,86 @@ const requestFCMPermission = async (): Promise<string | null> => {
     if (loading) return;
 
     setLoading(true);
+
     try {
+      const network = await NetInfo.fetch();
+
+      const isOnline =
+        network.isConnected === true && network.isInternetReachable !== false;
+
+      // =========================================
+      // OFFLINE LOGIN
+      // =========================================
+      if (!isOnline) {
+        const offlineUserId = await AsyncStorage.getItem("offlineUserId");
+
+        const offlineEmail = await AsyncStorage.getItem("offlineUserEmail");
+
+        if (
+          !offlineUserId ||
+          !offlineEmail ||
+          offlineEmail.toLowerCase() !== trimmedEmail
+        ) {
+          Alert.alert(
+            "Offline Login",
+            "This account has not been verified for offline access on this device. Connect to the internet and log in first.",
+          );
+          return;
+        }
+
+        const safeUserId = offlineUserId.replace(/[^A-Za-z0-9._-]/g, "_");
+        const savedVerifier = await secureGet(`offlineLogin.${safeUserId}`);
+
+        if (!savedVerifier) {
+          Alert.alert(
+            "Offline Login",
+            "Offline credentials are unavailable. Connect to the internet to log in.",
+          );
+          return;
+        }
+
+        const saved = JSON.parse(savedVerifier);
+
+        const enteredVerifier = await createPasswordVerifier(
+          password,
+          saved.salt,
+        );
+
+        if (
+          saved.email !== trimmedEmail ||
+          saved.verifier !== enteredVerifier
+        ) {
+          Alert.alert("Login Failed", "Incorrect email or password.");
+          return;
+        }
+
+        // Offline access is a local session, not a new
+        // server authentication or a valid new API token.
+        await AsyncStorage.multiSet([
+          ["userId", offlineUserId],
+          ["userEmail", trimmedEmail],
+          ["userName", (await AsyncStorage.getItem("offlineUserName")) || ""],
+          ["isLoggedIn", "true"],
+          ["offlineMode", "true"],
+        ]);
+
+        Alert.alert(
+          "Offline Login",
+          "Login successful. You are working offline. Sync your data when internet returns.",
+          [
+            {
+              text: "Continue",
+              onPress: () => router.replace("/home"),
+            },
+          ],
+        );
+
+        return;
+      }
+
+      // =========================================
+      // ONLINE LOGIN
+      // =========================================
       const response = await API.post("/api/userLoginOrLogout", {
         type: "login",
         email: trimmedEmail,
@@ -104,22 +198,15 @@ const requestFCMPermission = async (): Promise<string | null> => {
       });
 
       const data = response?.data;
+
       const userId = data?.userId ?? data?.userid ?? data?.user_id;
       const loginToken = data?.token ?? data?.accessToken ?? data?.access_token;
       const userName = data?.userName ?? data?.username ?? data?.name ?? "";
 
-      if (!userId) {
+      if (!userId || !loginToken) {
         Alert.alert(
-          "Login failed",
-          data?.message || "The server did not return a user ID."
-        );
-        return;
-      }
-
-      if (!loginToken) {
-        Alert.alert(
-          "Login failed",
-          data?.message || "The server did not return an authentication token."
+          "Login Failed",
+          data?.message || "The server did not return valid login details.",
         );
         return;
       }
@@ -128,23 +215,33 @@ const requestFCMPermission = async (): Promise<string | null> => {
       const normalizedToken = String(loginToken).trim();
 
       if (!normalizedUserId || !normalizedToken) {
-        Alert.alert("Login failed", "The server returned invalid login details.");
+        Alert.alert("Login Failed", "Invalid server login details.");
         return;
       }
 
-      // Persist the authenticated session for the Splash Screen.
+      // Save normal authenticated session
       await AsyncStorage.multiSet([
         ["userId", normalizedUserId],
         ["login_token", normalizedToken],
         ["userEmail", trimmedEmail],
         ["isLoggedIn", "true"],
+        ["offlineMode", "false"],
+        ["offlineUserId", normalizedUserId],
+        ["offlineUserEmail", trimmedEmail],
+        ["offlineUserName", String(userName)],
+        ["userName", String(userName)],
       ]);
 
-      if (userName) {
-        await AsyncStorage.setItem("userName", String(userName));
-      }
+      // Cache the offline password verifier only after
+      // the backend confirms successful authentication.
+      await saveOfflineLogin(
+        normalizedUserId,
+        trimmedEmail,
+        String(userName),
+        password,
+      );
 
-      // FCM is optional. Continue login if permission/token setup fails.
+      // FCM is optional. Never block login on notification setup.
       const fcmToken = await requestFCMPermission();
 
       if (fcmToken) {
@@ -157,32 +254,29 @@ const requestFCMPermission = async (): Promise<string | null> => {
           await API.post(
             "/api/sendFcmTokenToBackend",
             { token: fcmToken },
-            { headers: { Authorization: `Bearer ${normalizedToken}` } }
+            {
+              headers: {
+                Authorization: `Bearer ${normalizedToken}`,
+              },
+            },
           );
         } catch (error: any) {
-          console.warn(
-            "Could not upload FCM token:",
-            error?.response?.data || error?.message || error
-          );
+          console.warn("FCM upload failed:", error?.message);
         }
       }
 
-     
-
-      // Navigate only after the credentials/session have been saved.
       router.replace("/home");
     } catch (error: any) {
       console.error(
         "Login error:",
-        error?.response?.data || error?.message || error
+        error?.response?.data || error?.message || error,
       );
 
-      const message =
+      Alert.alert(
+        "Login Failed",
         error?.response?.data?.message ||
-        error?.message ||
-        "Unable to log in. Please check your details and try again.";
-
-      Alert.alert("Login failed", message);
+          "Unable to verify your login. Check your connection and try again.",
+      );
     } finally {
       setLoading(false);
     }
@@ -192,83 +286,142 @@ const requestFCMPermission = async (): Promise<string | null> => {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor={COLORS.background} />
       <KeyboardAvoidingView
-        style={styles.keyboard}
+        style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={0}
       >
         <ScrollView
-          contentContainerStyle={styles.scrollContent}
+          contentContainerStyle={[
+            styles.scrollContent,
+            isDesktop && styles.desktopScrollContent,
+          ]}
           keyboardShouldPersistTaps="handled"
-          keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+          keyboardDismissMode={
+            Platform.OS === "ios" ? "interactive" : "on-drag"
+          }
           showsVerticalScrollIndicator={false}
           automaticallyAdjustKeyboardInsets={Platform.OS === "ios"}
         >
-          <View style={styles.topAccent}>
-            <View style={styles.brandIcon}>
-              <Ionicons name="checkmark-done" size={34} color={COLORS.primary} />
+          <View
+            style={[styles.brandHeader, isDesktop && styles.desktopBrandHeader]}
+          >
+            <View style={styles.brandMark}>
+              <Ionicons name="checkmark-done" size={27} color="#FFFFFF" />
             </View>
-            <Text style={styles.brandName}>My Todo</Text>
-            <Text style={styles.brandCaption}>Plan your day. Make it count.</Text>
+            <Text style={styles.brandName}>
+              Todo<Text style={styles.brandAccent}>List</Text>
+            </Text>
+            <Text style={styles.brandTagline}>Make room for what matters.</Text>
+
+            {isDesktop && (
+              <View style={styles.desktopHeroContent}>
+                <Text style={styles.desktopHeroEyebrow}>
+                  YOUR PERSONAL PRODUCTIVITY SPACE
+                </Text>
+                <Text style={styles.desktopHeroTitle}>
+                  Make time for what matters.
+                </Text>
+                <Text style={styles.desktopHeroDescription}>
+                  Bring your tasks, notes and daily plans together in one calm,
+                  organized workspace.
+                </Text>
+                <View style={styles.desktopFeatureList}>
+                  {[
+                    ["checkbox-outline", "Organize everyday tasks"],
+                    ["document-text-outline", "Keep notes in one place"],
+                    ["calendar-outline", "Plan your schedule"],
+                    ["notifications-outline", "Stay on top of reminders"],
+                  ].map(([icon, label]) => (
+                    <View style={styles.desktopFeatureRow} key={label}>
+                      <View style={styles.desktopFeatureIcon}>
+                        <Ionicons
+                          name={icon as any}
+                          size={18}
+                          color={COLORS.primary}
+                        />
+                      </View>
+                      <Text style={styles.desktopFeatureText}>{label}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            )}
           </View>
 
-          <View style={styles.card}>
-            <Text style={styles.greeting}>Welcome back 👋</Text>
-            <Text style={styles.title}>Login to your account</Text>
-            <Text style={styles.subtitle}>
-              Pick up where you left off and keep your day on track.
-            </Text>
+          <View style={[styles.card, isDesktop && styles.desktopCard]}>
+            <View style={styles.headingRow}>
+              <View style={styles.headingCopy}>
+                <Text style={styles.greeting}>YOUR PRODUCTIVE LIFE</Text>
+                <Text style={styles.title}>Welcome back</Text>
+                <Text style={styles.subtitle}>
+                  Log in to continue your tasks, notes and daily plans.
+                </Text>
+              </View>
+              <View style={styles.headingIcon}>
+                <Ionicons
+                  name="calendar-outline"
+                  size={25}
+                  color={COLORS.primary}
+                />
+              </View>
+            </View>
 
-            <Text style={styles.fieldLabel}>EMAIL ADDRESS</Text>
             <View style={styles.inputContainer}>
               <View style={styles.inputIcon}>
-                <Ionicons name="mail-outline" size={20} color={COLORS.primary} />
+                <Ionicons
+                  name="mail-outline"
+                  size={19}
+                  color={COLORS.primary}
+                />
               </View>
               <TextInput
-                style={styles.input}
-                placeholder="you@example.com"
-                placeholderTextColor="#A3AAA8"
+                placeholder="Email address"
+                placeholderTextColor={COLORS.secondaryText}
                 value={email}
                 onChangeText={setEmail}
+                style={styles.input}
                 keyboardType="email-address"
                 autoCapitalize="none"
                 autoCorrect={false}
                 editable={!loading}
                 returnKeyType="next"
+                accessibilityLabel="Email address"
               />
             </View>
 
-            <Text style={styles.fieldLabel}>PASSWORD</Text>
             <View style={styles.inputContainer}>
               <View style={styles.inputIcon}>
                 <Ionicons
                   name="lock-closed-outline"
-                  size={20}
+                  size={19}
                   color={COLORS.primary}
                 />
               </View>
               <TextInput
-                style={styles.input}
-                placeholder="Enter your password"
-                placeholderTextColor="#A3AAA8"
+                placeholder="Password"
+                placeholderTextColor={COLORS.secondaryText}
                 value={password}
                 onChangeText={setPassword}
+                style={styles.input}
                 secureTextEntry={!showPassword}
                 autoCapitalize="none"
                 autoCorrect={false}
                 editable={!loading}
                 returnKeyType="done"
                 onSubmitEditing={handleLogin}
+                accessibilityLabel="Password"
               />
               <Pressable
                 onPress={() => setShowPassword((current) => !current)}
                 disabled={loading}
                 hitSlop={10}
-                accessibilityLabel={showPassword ? "Hide password" : "Show password"}
+                accessibilityLabel={
+                  showPassword ? "Hide password" : "Show password"
+                }
               >
                 <Ionicons
                   name={showPassword ? "eye-off-outline" : "eye-outline"}
                   size={21}
-                  color={COLORS.secondary}
+                  color={COLORS.secondaryText}
                 />
               </Pressable>
             </View>
@@ -277,17 +430,18 @@ const requestFCMPermission = async (): Promise<string | null> => {
               style={[styles.loginButton, loading && styles.buttonDisabled]}
               onPress={handleLogin}
               disabled={loading}
+              accessibilityRole="button"
+              accessibilityLabel="Log in"
             >
               {loading ? (
-                <ActivityIndicator color={COLORS.white} />
+                <>
+                  <ActivityIndicator color="#FFFFFF" />
+                  <Text style={styles.loginButtonText}>Signing in...</Text>
+                </>
               ) : (
                 <>
-                  <Text style={styles.loginButtonText}>Login</Text>
-                  <Ionicons
-                    name="arrow-forward"
-                    size={20}
-                    color={COLORS.white}
-                  />
+                  <Text style={styles.loginButtonText}>Log in</Text>
+                  <Ionicons name="arrow-forward" size={20} color="#FFFFFF" />
                 </>
               )}
             </Pressable>
@@ -304,12 +458,14 @@ const requestFCMPermission = async (): Promise<string | null> => {
             </View>
           </View>
 
-          <View style={styles.footer}>
-            <Ionicons name="leaf-outline" size={17} color={COLORS.primary} />
-            <Text style={styles.footerText}>
-              Small steps lead to big achievements.
-            </Text>
-          </View>
+          {!isDesktop && (
+            <View style={styles.footer}>
+              <Ionicons name="leaf-outline" size={16} color={COLORS.primary} />
+              <Text style={styles.footerText}>
+                Small steps. Meaningful progress.
+              </Text>
+            </View>
+          )}
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -317,159 +473,214 @@ const requestFCMPermission = async (): Promise<string | null> => {
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: COLORS.background,
-  },
-  keyboard: {
-    flex: 1,
-  },
+  flex: { flex: 1 },
+  safeArea: { flex: 1, backgroundColor: COLORS.background },
   scrollContent: {
     flexGrow: 1,
+    paddingHorizontal: 18,
+    paddingTop: 18,
+    paddingBottom: 24,
     justifyContent: "center",
-    paddingHorizontal: 22,
-    paddingTop: 24,
-    paddingBottom: 28,
   },
-  topAccent: {
-    alignItems: "center",
-    marginBottom: 26,
-  },
-  brandIcon: {
-    width: 70,
-    height: 70,
-    borderRadius: 24,
-    backgroundColor: COLORS.mint,
+  brandHeader: { alignItems: "center", marginBottom: 22 },
+  brandMark: {
+    width: 54,
+    height: 54,
+    borderRadius: 18,
+    backgroundColor: COLORS.primary,
     alignItems: "center",
     justifyContent: "center",
-    marginBottom: 12,
+    marginBottom: 9,
   },
   brandName: {
-    color: COLORS.dark,
-    fontSize: 24,
-    fontWeight: "800",
-    letterSpacing: -0.5,
+    color: COLORS.primary,
+    fontSize: 27,
+    fontWeight: "900",
+    letterSpacing: -1,
   },
-  brandCaption: {
-    color: COLORS.secondary,
-    fontSize: 13,
-    marginTop: 5,
-  },
+  brandAccent: { color: COLORS.accent },
+  brandTagline: { color: COLORS.secondaryText, fontSize: 12, marginTop: 4 },
   card: {
-    backgroundColor: COLORS.white,
-    borderRadius: 26,
-    padding: 23,
+    width: "100%",
+    maxWidth: 480,
+    alignSelf: "center",
+    backgroundColor: COLORS.surface,
+    borderRadius: 25,
+    paddingHorizontal: 20,
+    paddingVertical: 22,
     borderWidth: 1,
     borderColor: COLORS.border,
-    shadowColor: "#263B35",
+    shadowColor: "#26392F",
     shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.06,
-    shadowRadius: 18,
+    shadowOpacity: 0.07,
+    shadowRadius: 20,
     elevation: 3,
   },
-  greeting: {
-    color: COLORS.primary,
-    fontSize: 13,
-    fontWeight: "800",
-    marginBottom: 8,
-  },
-  title: {
-    color: COLORS.dark,
-    fontSize: 25,
-    fontWeight: "800",
-    letterSpacing: -0.6,
-  },
-  subtitle: {
-    color: COLORS.secondary,
-    fontSize: 13,
-    lineHeight: 20,
-    marginTop: 8,
-    marginBottom: 24,
-  },
-  fieldLabel: {
-    color: COLORS.secondary,
-    fontSize: 10,
-    fontWeight: "800",
-    letterSpacing: 1.2,
-    marginBottom: 8,
-    marginTop: 4,
-  },
-  inputContainer: {
-    minHeight: 56,
+  headingRow: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#FBFDFC",
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 15,
-    paddingHorizontal: 12,
-    marginBottom: 17,
+    justifyContent: "space-between",
+    marginBottom: 18,
+    gap: 10,
   },
-  inputIcon: {
-    width: 35,
-    height: 35,
-    borderRadius: 11,
+  headingCopy: { flex: 1 },
+  greeting: {
+    color: COLORS.primary,
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 1.5,
+    marginBottom: 7,
+  },
+  title: {
+    color: COLORS.text,
+    fontSize: 25,
+    fontWeight: "800",
+    letterSpacing: -0.7,
+  },
+  subtitle: {
+    color: COLORS.secondaryText,
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 4,
+  },
+  headingIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 15,
     backgroundColor: COLORS.mint,
     alignItems: "center",
     justifyContent: "center",
-    marginRight: 10,
+  },
+  inputContainer: {
+    minHeight: 52,
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: COLORS.paleMint,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    marginBottom: 12,
+  },
+  inputIcon: {
+    width: 30,
+    height: 30,
+    borderRadius: 9,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
   },
   input: {
     flex: 1,
-    minHeight: 52,
-    color: COLORS.dark,
-    fontSize: 14,
-    paddingVertical: 10,
+    minWidth: 0,
+    minHeight: 48,
+    color: COLORS.text,
+    fontSize: 13,
+    paddingVertical: 7,
   },
   loginButton: {
-    minHeight: 55,
-    borderRadius: 16,
-    backgroundColor: COLORS.primary,
+    minHeight: 53,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 12,
-    marginTop: 8,
+    gap: 10,
+    backgroundColor: COLORS.primary,
+    borderRadius: 13,
+    marginTop: 4,
+    paddingHorizontal: 16,
     shadowColor: COLORS.primary,
-    shadowOffset: { width: 0, height: 5 },
-    shadowOpacity: 0.2,
-    shadowRadius: 9,
-    elevation: 3,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.14,
+    shadowRadius: 6,
+    elevation: 2,
   },
-  buttonDisabled: {
-    opacity: 0.65,
-  },
-  loginButtonText: {
-    color: COLORS.white,
-    fontSize: 16,
-    fontWeight: "800",
-  },
+  buttonDisabled: { opacity: 0.65 },
+  loginButtonText: { color: "#FFFFFF", fontSize: 14, fontWeight: "800" },
   registerRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     flexWrap: "wrap",
-    marginTop: 22,
     gap: 5,
+    marginTop: 14,
   },
-  registerText: {
-    color: COLORS.secondary,
-    fontSize: 13,
-  },
-  registerLink: {
-    color: COLORS.primary,
-    fontSize: 13,
-    fontWeight: "800",
-  },
+  registerText: { color: COLORS.secondaryText, fontSize: 12 },
+  registerLink: { color: COLORS.primary, fontSize: 13, fontWeight: "800" },
   footer: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 7,
-    marginTop: 24,
+    marginTop: 12,
   },
-  footerText: {
-    color: COLORS.secondary,
+  footerText: { color: COLORS.secondaryText, fontSize: 11 },
+  desktopScrollContent: {
+    flexGrow: 1,
+    width: "100%",
+    maxWidth: 1500,
+    alignSelf: "center",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 56,
+    paddingHorizontal: 56,
+    paddingVertical: 36,
+  },
+  desktopBrandHeader: {
+    flex: 1,
+    minWidth: 0,
+    maxWidth: 570,
+    minHeight: 650,
+    alignSelf: "stretch",
+    justifyContent: "center",
+    alignItems: "flex-start",
+    backgroundColor: "#E9EFE5",
+    borderRadius: 28,
+    paddingHorizontal: 46,
+    paddingVertical: 42,
+    marginBottom: 0,
+  },
+  desktopHeroContent: { width: "100%", marginTop: 70 },
+  desktopHeroEyebrow: {
+    color: COLORS.primary,
     fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 1.7,
+    marginBottom: 16,
+  },
+  desktopHeroTitle: {
+    color: COLORS.text,
+    fontSize: 43,
+    lineHeight: 52,
+    fontWeight: "900",
+    letterSpacing: -1.5,
+    maxWidth: 430,
+  },
+  desktopHeroDescription: {
+    color: COLORS.secondaryText,
+    fontSize: 15,
+    lineHeight: 25,
+    marginTop: 17,
+    maxWidth: 410,
+  },
+  desktopFeatureList: { gap: 17, marginTop: 38 },
+  desktopFeatureRow: { flexDirection: "row", alignItems: "center", gap: 13 },
+  desktopFeatureIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  desktopFeatureText: { color: COLORS.text, fontSize: 14, fontWeight: "600" },
+  desktopCard: {
+    flex: 1,
+    width: "100%",
+    maxWidth: 590,
+    alignSelf: "center",
+    paddingHorizontal: 34,
+    paddingVertical: 30,
+    borderRadius: 24,
   },
 });

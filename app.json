@@ -14,7 +14,9 @@
       "package": "com.keerthi2693.MyTodoApp",
       "softwareKeyboardLayoutMode": "resize",
       "googleServicesFile": "./google-services.json",
-      "permissions": ["android.permission.READ_CONTACTS"],
+      "permissions": [
+        "android.permission.READ_CONTACTS"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -51,7 +53,8 @@
         {
           "contactsPermission": "Allow MyTodoApp to access your contacts."
         }
-      ]
+      ],
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true,

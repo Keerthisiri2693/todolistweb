@@ -1,7 +1,12 @@
+import { useSecurity } from "@/security/SecurityProvider";
+import { Ionicons } from "@expo/vector-icons";
+import * as LocalAuthentication from "expo-local-authentication";
+import { useRouter } from "expo-router";
 import React, { useMemo, useRef, useState } from "react";
 import {
   Alert,
   PanResponder,
+  Platform,
   Pressable,
   ScrollView,
   Switch,
@@ -11,8 +16,6 @@ import {
   useWindowDimensions,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import * as LocalAuthentication from "expo-local-authentication";
-import { useSecurity } from "@/security/SecurityProvider";
 
 type PatternGridProps = {
   onComplete: (pattern: number[]) => void;
@@ -20,19 +23,36 @@ type PatternGridProps = {
   resetKey?: number;
 };
 
+const isWeb = Platform.OS === "web";
+
+/** Use browser dialogs in Electron/Expo Web and native dialogs on Android/iOS. */
+function showMessage(title: string, message: string) {
+  if (isWeb && typeof window !== "undefined") {
+    window.alert(`${title}\n\n${message}`);
+    return;
+  }
+  Alert.alert(title, message);
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Please try again.";
+}
+
 function PatternGrid({
   onComplete,
   disabled = false,
   resetKey = 0,
 }: PatternGridProps) {
   const { width: windowWidth } = useWindowDimensions();
-  const gridSize = Math.min(windowWidth - 72, 300);
+  const gridSize = Math.max(220, Math.min(windowWidth - 72, 300));
   const dotRadius = 12;
-  const hitRadius = 28;
+  const hitRadius = 30;
+
   const [selected, setSelected] = useState<number[]>([]);
   const selectedRef = useRef<number[]>([]);
   const gridSizeRef = useRef(gridSize);
   const completedRef = useRef(false);
+  const drawingRef = useRef(false);
 
   gridSizeRef.current = gridSize;
 
@@ -42,17 +62,20 @@ function PatternGrid({
         x: (index % 3) * (gridSize / 3) + gridSize / 6,
         y: Math.floor(index / 3) * (gridSize / 3) + gridSize / 6,
       })),
-    [gridSize]
+    [gridSize],
   );
 
   const clearPattern = () => {
     selectedRef.current = [];
     setSelected([]);
     completedRef.current = false;
+    drawingRef.current = false;
   };
 
   React.useEffect(() => {
     clearPattern();
+    // resetKey intentionally resets the drawing surface between confirmations.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resetKey]);
 
   const addDotAt = (x: number, y: number) => {
@@ -67,35 +90,47 @@ function PatternGrid({
     if (Math.hypot(x - centerX, y - centerY) > hitRadius) return;
     if (selectedRef.current.includes(index)) return;
 
-    // Android-style behavior: when a move skips over the middle dot in a
-    // straight line, include that dot in the pattern as well.
+    // Include a skipped middle dot, as Android pattern locks do.
     const previous = selectedRef.current[selectedRef.current.length - 1];
     if (previous !== undefined) {
       const prevRow = Math.floor(previous / 3);
       const prevCol = previous % 3;
       const rowDiff = row - prevRow;
       const colDiff = col - prevCol;
+      let middle: number | null = null;
 
       if (Math.abs(rowDiff) === 2 && colDiff === 0) {
-        const middle = (prevRow + row) / 2 * 3 + col;
-        if (!selectedRef.current.includes(middle)) {
-          selectedRef.current = [...selectedRef.current, middle];
-        }
+        middle = ((prevRow + row) / 2) * 3 + col;
       } else if (Math.abs(colDiff) === 2 && rowDiff === 0) {
-        const middle = row * 3 + (prevCol + col) / 2;
-        if (!selectedRef.current.includes(middle)) {
-          selectedRef.current = [...selectedRef.current, middle];
-        }
+        middle = row * 3 + (prevCol + col) / 2;
       } else if (Math.abs(rowDiff) === 2 && Math.abs(colDiff) === 2) {
-        const middle = ((prevRow + row) / 2) * 3 + (prevCol + col) / 2;
-        if (!selectedRef.current.includes(middle)) {
-          selectedRef.current = [...selectedRef.current, middle];
-        }
+        middle = ((prevRow + row) / 2) * 3 + (prevCol + col) / 2;
+      }
+
+      if (middle !== null && !selectedRef.current.includes(middle)) {
+        selectedRef.current = [...selectedRef.current, middle];
       }
     }
 
     selectedRef.current = [...selectedRef.current, index];
-    setSelected(selectedRef.current);
+    setSelected([...selectedRef.current]);
+  };
+
+  const finishPattern = () => {
+    if (disabled || completedRef.current || !drawingRef.current) return;
+    drawingRef.current = false;
+    completedRef.current = true;
+
+    const result = [...selectedRef.current];
+    if (result.length >= 4) {
+      onComplete(result);
+    } else {
+      clearPattern();
+      showMessage(
+        "Pattern too short",
+        "Connect at least 4 dots to create a pattern.",
+      );
+    }
   };
 
   const panResponder = useMemo(
@@ -106,50 +141,104 @@ function PatternGrid({
         onPanResponderGrant: (event) => {
           if (disabled) return;
           clearPattern();
-          addDotAt(
-            event.nativeEvent.locationX,
-            event.nativeEvent.locationY
-          );
+          drawingRef.current = true;
+          addDotAt(event.nativeEvent.locationX, event.nativeEvent.locationY);
         },
         onPanResponderMove: (event) => {
-          if (disabled || completedRef.current) return;
-          addDotAt(
-            event.nativeEvent.locationX,
-            event.nativeEvent.locationY
-          );
+          if (disabled || completedRef.current || !drawingRef.current) return;
+          addDotAt(event.nativeEvent.locationX, event.nativeEvent.locationY);
         },
-        onPanResponderRelease: () => {
-          if (disabled || completedRef.current) return;
-          completedRef.current = true;
-          const result = [...selectedRef.current];
-          if (result.length >= 4) {
-            onComplete(result);
-          } else {
-            clearPattern();
-            Alert.alert(
-              "Pattern too short",
-              "Connect at least 4 dots to create a pattern."
-            );
-          }
-        },
+        onPanResponderRelease: finishPattern,
         onPanResponderTerminate: clearPattern,
         onPanResponderTerminationRequest: () => false,
       }),
-    [disabled, onComplete, gridSize]
+    // gridSize is included because the responder is attached to this grid.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [disabled, onComplete, gridSize],
   );
+
+  // React Native Web/Electron uses pointer events for reliable mouse dragging.
+  const webPointerHandlers = isWeb
+    ? {
+        onPointerDown: (event: any) => {
+          if (disabled) return;
+          event.preventDefault?.();
+          clearPattern();
+          drawingRef.current = true;
+          const native = event.nativeEvent ?? event;
+          addDotAt(
+            native.locationX ?? native.offsetX ?? 0,
+            native.locationY ?? native.offsetY ?? 0,
+          );
+        },
+        onPointerMove: (event: any) => {
+          if (disabled || completedRef.current || !drawingRef.current) return;
+          const native = event.nativeEvent ?? event;
+          addDotAt(
+            native.locationX ?? native.offsetX ?? 0,
+            native.locationY ?? native.offsetY ?? 0,
+          );
+        },
+        onPointerUp: finishPattern,
+        onPointerCancel: clearPattern,
+        onPointerLeave: (event: any) => {
+          // Do not finish on a brief leave; pointer-up completes the pattern.
+          void event;
+        },
+      }
+    : {};
 
   return (
     <View
-      style={{
-        width: gridSize,
-        height: gridSize,
-        alignSelf: "center",
-        position: "relative",
-        marginVertical: 12,
-      }}
-      {...panResponder.panHandlers}
+      style={[
+        styles.patternGrid,
+        {
+          width: gridSize,
+          height: gridSize,
+          ...(isWeb
+            ? ({
+                touchAction: "none",
+                userSelect: "none",
+                cursor: disabled ? "default" : "crosshair",
+              } as any)
+            : {}),
+        },
+      ]}
+      {...(isWeb ? (webPointerHandlers as any) : panResponder.panHandlers)}
       accessibilityLabel="3 by 3 pattern grid"
     >
+      {selected.slice(1).map((index, position) => {
+        const from = centers[selected[position]];
+        const to = centers[index];
+        if (!from || !to) return null;
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const length = Math.hypot(dx, dy);
+        const angle = Math.atan2(dy, dx);
+        const midX = (from.x + to.x) / 2;
+        const midY = (from.y + to.y) / 2;
+
+        return (
+          <View
+            key={`line-${position}`}
+            pointerEvents="none"
+            style={{
+              position: "absolute",
+              left: midX,
+              top: midY - 2,
+              width: length,
+              height: 4,
+              borderRadius: 2,
+              backgroundColor: "#10B981",
+              transform: [
+                { translateX: -length / 2 },
+                { rotate: `${angle}rad` },
+              ],
+            }}
+          />
+        );
+      })}
+
       {centers.map((center, index) => (
         <View
           key={index}
@@ -167,36 +256,15 @@ function PatternGrid({
           }}
         />
       ))}
-      {selected.slice(1).map((index, position) => {
-        const from = centers[selected[position]];
-        const to = centers[index];
-        const dx = to.x - from.x;
-        const dy = to.y - from.y;
-        const length = Math.hypot(dx, dy);
-        const angle = Math.atan2(dy, dx);
-        return (
-          <View
-            key={`line-${position}`}
-            pointerEvents="none"
-            style={{
-              position: "absolute",
-              left: from.x,
-              top: from.y - 2,
-              width: length,
-              height: 4,
-              borderRadius: 2,
-              backgroundColor: "#10B981",
-              transform: [{ rotate: `${angle}rad` }],
-              transformOrigin: "left center" as never,
-            }}
-          />
-        );
-      })}
     </View>
   );
 }
 
 export default function SecuritySettingsScreen() {
+  const router = useRouter();
+  const { width: windowWidth } = useWindowDimensions();
+  const isDesktop = Platform.OS === "web";
+
   const {
     config,
     setPin,
@@ -217,30 +285,37 @@ export default function SecuritySettingsScreen() {
   const [firstPattern, setFirstPattern] = useState<number[] | null>(null);
   const [patternResetKey, setPatternResetKey] = useState(0);
   const [patternMessage, setPatternMessage] = useState(
-    "Draw a pattern connecting at least 4 dots."
+    "Draw a pattern connecting at least 4 dots.",
   );
 
   const hasPin = Boolean(config.pinHash && config.pinSalt);
   const hasPattern = Boolean(config.patternHash && config.patternSalt);
   const hasUnlockMethod = hasPin || hasPattern;
+  const contentWidth = isDesktop ? Math.min(windowWidth - 48, 760) : undefined;
 
   const savePin = async () => {
     if (!/^\d{6,8}$/.test(newPin)) {
-      Alert.alert("Invalid PIN", "Enter 6–8 digits.");
+      showMessage("Invalid PIN", "Enter 6–8 digits.");
+      return;
+    }
+
+    if (hasPin && !/^\d{6,8}$/.test(oldPin)) {
+      showMessage("Current PIN required", "Enter your current 6–8 digit PIN.");
       return;
     }
 
     if (newPin !== confirmPin) {
-      Alert.alert("PIN mismatch", "The two PINs do not match.");
+      showMessage("PIN mismatch", "The two PINs do not match.");
       return;
     }
 
+    if (busy) return;
     setBusy(true);
     try {
       if (hasPin) {
         const changed = await changePin(oldPin, newPin);
         if (!changed) {
-          Alert.alert("Incorrect PIN", "Your current PIN is incorrect.");
+          showMessage("Incorrect PIN", "Your current PIN is incorrect.");
           return;
         }
       } else {
@@ -250,12 +325,9 @@ export default function SecuritySettingsScreen() {
       setOldPin("");
       setNewPin("");
       setConfirmPin("");
-      Alert.alert("PIN saved", "Your security PIN has been updated.");
+      showMessage("PIN saved", "Your security PIN has been updated.");
     } catch (error) {
-      Alert.alert(
-        "Unable to save PIN",
-        error instanceof Error ? error.message : "Please try again."
-      );
+      showMessage("Unable to save PIN", getErrorMessage(error));
     } finally {
       setBusy(false);
     }
@@ -265,9 +337,9 @@ export default function SecuritySettingsScreen() {
     try {
       if (enabled) {
         if (!hasUnlockMethod) {
-          Alert.alert(
+          showMessage(
             "Set a PIN or pattern first",
-            "Create a security PIN or pattern before enabling app lock."
+            "Create a security PIN or pattern before enabling app lock.",
           );
           return;
         }
@@ -276,14 +348,19 @@ export default function SecuritySettingsScreen() {
         await disableAppLock();
       }
     } catch (error) {
-      Alert.alert(
-        "Unable to update app lock",
-        error instanceof Error ? error.message : "Please try again."
-      );
+      showMessage("Unable to update app lock", getErrorMessage(error));
     }
   };
 
   const toggleBiometrics = async (enabled: boolean) => {
+    if (isDesktop) {
+      showMessage(
+        "Biometrics unavailable",
+        "Fingerprint authentication is not supported by this Electron desktop implementation. Use your PIN or pattern instead.",
+      );
+      return;
+    }
+
     try {
       if (!enabled) {
         await updateSettings({ biometricEnabled: false });
@@ -291,9 +368,9 @@ export default function SecuritySettingsScreen() {
       }
 
       if (!hasPin) {
-        Alert.alert(
+        showMessage(
           "Set a PIN first",
-          "Configure a security PIN before enabling biometric unlock."
+          "Configure a security PIN before enabling biometric unlock.",
         );
         return;
       }
@@ -302,20 +379,17 @@ export default function SecuritySettingsScreen() {
       const enrolled = await LocalAuthentication.isEnrolledAsync();
 
       if (!hardware || !enrolled) {
-        Alert.alert(
+        showMessage(
           "Biometrics unavailable",
-          "Set up a fingerprint or supported biometric in your Android device settings first."
+          "Set up a fingerprint or supported biometric in your device settings first.",
         );
         return;
       }
 
       await updateSettings({ biometricEnabled: true });
-      Alert.alert("Enabled", "Biometric unlock is enabled.");
+      showMessage("Enabled", "Biometric unlock is enabled.");
     } catch (error) {
-      Alert.alert(
-        "Unable to update biometrics",
-        error instanceof Error ? error.message : "Please try again."
-      );
+      showMessage("Unable to update biometrics", getErrorMessage(error));
     }
   };
 
@@ -349,43 +423,43 @@ export default function SecuritySettingsScreen() {
       await setPattern(drawnPattern);
       setPatternSetupVisible(false);
       setFirstPattern(null);
-      Alert.alert("Pattern saved", "Your pattern lock has been configured.");
+      showMessage("Pattern saved", "Your pattern lock has been configured.");
     } catch (error) {
-      Alert.alert(
-        "Unable to save pattern",
-        error instanceof Error ? error.message : "Please try again."
-      );
+      showMessage("Unable to save pattern", getErrorMessage(error));
     } finally {
       setBusy(false);
       setPatternResetKey((key) => key + 1);
     }
   };
 
+  const performRemovePattern = async () => {
+    try {
+      await removeAppPattern();
+      showMessage("Pattern removed", "Your pattern has been removed.");
+    } catch (error) {
+      showMessage("Unable to remove pattern", getErrorMessage(error));
+    }
+  };
+
   const handleRemovePattern = () => {
-    Alert.alert(
-      "Remove pattern lock?",
-      "You will no longer be able to unlock using this pattern.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Remove",
-          style: "destructive",
-          onPress: () => {
-            void (async () => {
-              try {
-                await removeAppPattern();
-                Alert.alert("Pattern removed", "Your pattern has been removed.");
-              } catch (error) {
-                Alert.alert(
-                  "Unable to remove pattern",
-                  error instanceof Error ? error.message : "Please try again."
-                );
-              }
-            })();
-          },
-        },
-      ]
-    );
+    const title = "Remove pattern lock?";
+    const message = "You will no longer be able to unlock using this pattern.";
+
+    if (isDesktop && typeof window !== "undefined") {
+      if (window.confirm(`${title}\n\n${message}`)) {
+        void performRemovePattern();
+      }
+      return;
+    }
+
+    Alert.alert(title, message, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Remove",
+        style: "destructive",
+        onPress: () => void performRemovePattern(),
+      },
+    ]);
   };
 
   const Row = ({
@@ -393,19 +467,22 @@ export default function SecuritySettingsScreen() {
     description,
     value,
     onValueChange,
+    disabled = false,
   }: {
     title: string;
     description: string;
     value: boolean;
     onValueChange: (value: boolean) => void | Promise<void>;
+    disabled?: boolean;
   }) => (
     <View style={styles.row}>
-      <View style={{ flex: 1 }}>
+      <View style={{ flex: 1, minWidth: 0 }}>
         <Text style={styles.rowTitle}>{title}</Text>
         <Text style={styles.rowDescription}>{description}</Text>
       </View>
       <Switch
         value={value}
+        disabled={disabled}
         onValueChange={(nextValue) => void onValueChange(nextValue)}
         trackColor={{ false: "#D1D5DB", true: "#A7F3D0" }}
         thumbColor={value ? "#059669" : "#F9FAFB"}
@@ -415,15 +492,34 @@ export default function SecuritySettingsScreen() {
 
   return (
     <SafeAreaView style={styles.screen}>
-      <ScrollView contentContainerStyle={styles.content}>
-        <Text style={styles.heading}>Privacy & Security</Text>
-        <Text style={styles.subtitle}>
-          Protect your notes and control private previews.
-        </Text>
+      <ScrollView
+        contentContainerStyle={[
+          styles.content,
+          isDesktop && styles.desktopContent,
+          contentWidth ? { width: contentWidth, alignSelf: "center" } : null,
+        ]}
+        keyboardShouldPersistTaps="handled"
+      >
+        <Pressable
+          onPress={() => router.back()}
+          style={styles.backButton}
+          accessibilityRole="button"
+          accessibilityLabel="Go back"
+          hitSlop={8}
+        >
+          <Ionicons name="arrow-back" size={20} color="#172B22" />
+          <Text style={styles.backButtonText}>Back</Text>
+        </Pressable>
+
+        <View style={styles.pageHeader}>
+          <Text style={styles.heading}>Privacy & Security</Text>
+          <Text style={styles.subtitle}>
+            Protect your notes and control private previews.
+          </Text>
+        </View>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>PIN protection</Text>
-
           {hasPin ? (
             <>
               <Text style={styles.configuredText}>
@@ -440,6 +536,8 @@ export default function SecuritySettingsScreen() {
                 secureTextEntry
                 maxLength={8}
                 style={styles.input}
+                autoComplete="off"
+                textContentType="none"
               />
             </>
           ) : (
@@ -459,6 +557,8 @@ export default function SecuritySettingsScreen() {
             secureTextEntry
             maxLength={8}
             style={styles.input}
+            autoComplete="off"
+            textContentType="none"
           />
 
           <TextInput
@@ -472,12 +572,18 @@ export default function SecuritySettingsScreen() {
             secureTextEntry
             maxLength={8}
             style={styles.input}
+            autoComplete="off"
+            textContentType="none"
           />
 
           <Pressable
             disabled={busy}
             onPress={() => void savePin()}
-            style={[styles.primaryButton, busy && styles.disabledButton]}
+            style={({ pressed }) => [
+              styles.primaryButton,
+              busy && styles.disabledButton,
+              pressed && !busy && styles.pressedButton,
+            ]}
           >
             <Text style={styles.primaryButtonText}>
               {busy ? "Saving..." : hasPin ? "Change PIN" : "Set PIN"}
@@ -488,8 +594,11 @@ export default function SecuritySettingsScreen() {
         <View style={[styles.card, styles.patternCard]}>
           <Text style={styles.sectionTitle}>Pattern lock</Text>
           <Text style={styles.rowDescription}>
-            Draw a pattern on the 3×3 grid. You must connect at least four dots
-            and confirm the same pattern twice.
+            Draw a pattern on the 3×3 grid. Connect at least four dots and
+            confirm the same pattern twice.{" "}
+            {isDesktop
+              ? "Use your mouse to drag across the dots."
+              : "Drag your finger across the dots."}
           </Text>
 
           <View style={styles.patternStatus}>
@@ -500,7 +609,9 @@ export default function SecuritySettingsScreen() {
               ]}
             />
             <Text style={styles.patternStatusText}>
-              {hasPattern ? "Pattern lock is configured" : "No pattern configured"}
+              {hasPattern
+                ? "Pattern lock is configured"
+                : "No pattern configured"}
             </Text>
           </View>
 
@@ -558,9 +669,14 @@ export default function SecuritySettingsScreen() {
 
           <Row
             title="Fingerprint / biometrics"
-            description="Use your device's native biometric prompt."
-            value={config.biometricEnabled}
+            description={
+              isDesktop
+                ? "Not available in this Electron desktop implementation."
+                : "Use your device's native biometric prompt."
+            }
+            value={isDesktop ? false : config.biometricEnabled}
             onValueChange={toggleBiometrics}
+            disabled={isDesktop}
           />
 
           <Row
@@ -600,6 +716,30 @@ const styles = {
     padding: 20,
     paddingBottom: 40,
   },
+  desktopContent: {
+    paddingTop: 28,
+    paddingHorizontal: 28,
+  },
+  pageHeader: {
+    marginBottom: 4,
+  },
+  backButton: {
+    alignSelf: "flex-start" as const,
+    flexDirection: "row" as const,
+    alignItems: "center" as const,
+    gap: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    marginBottom: 10,
+    marginLeft: -8,
+    borderRadius: 10,
+    cursor: "pointer" as any,
+  },
+  backButtonText: {
+    color: "#172B22",
+    fontSize: 14,
+    fontWeight: "700" as const,
+  },
   heading: {
     fontSize: 26,
     fontWeight: "800" as const,
@@ -617,6 +757,7 @@ const styles = {
     padding: 16,
     borderWidth: 1,
     borderColor: "#E1EAE4",
+    ...(isWeb ? ({ boxShadow: "0 5px 18px rgba(23,43,34,0.05)" } as any) : {}),
   },
   sectionTitle: {
     fontSize: 17,
@@ -638,6 +779,7 @@ const styles = {
     fontSize: 16,
     color: "#172B22",
     marginBottom: 10,
+    outlineStyle: "none" as any,
   },
   primaryButton: {
     backgroundColor: "#10B981",
@@ -646,9 +788,14 @@ const styles = {
     alignItems: "center" as const,
     justifyContent: "center" as const,
     marginTop: 6,
+    cursor: "pointer" as any,
   },
   disabledButton: {
     opacity: 0.6,
+    cursor: "not-allowed" as any,
+  },
+  pressedButton: {
+    opacity: 0.85,
   },
   primaryButtonText: {
     color: "#FFFFFF",
@@ -656,6 +803,13 @@ const styles = {
   },
   patternCard: {
     marginTop: 16,
+  },
+  patternGrid: {
+    alignSelf: "center" as const,
+    position: "relative" as const,
+    marginVertical: 12,
+    backgroundColor: "#F8FCF9",
+    borderRadius: 16,
   },
   patternStatus: {
     flexDirection: "row" as const,
@@ -695,6 +849,7 @@ const styles = {
     alignItems: "center" as const,
     width: "100%" as const,
     marginTop: 10,
+    cursor: "pointer" as any,
   },
   secondaryButtonText: {
     color: "#52645A",
@@ -707,6 +862,7 @@ const styles = {
     padding: 14,
     alignItems: "center" as const,
     marginTop: 10,
+    cursor: "pointer" as any,
   },
   removeButtonText: {
     color: "#C53030",
